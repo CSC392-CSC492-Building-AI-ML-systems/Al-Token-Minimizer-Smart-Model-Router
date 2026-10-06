@@ -4,7 +4,6 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi[standard]>=0.141.1",
-    "genai>=2.1.0",
-    "google>=3.0.0",
     "google-genai>=2.25.0",
+    "python-dotenv>=1.2.3",
 ]

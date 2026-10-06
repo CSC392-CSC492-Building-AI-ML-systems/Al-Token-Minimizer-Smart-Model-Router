@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# local sqlite telemetry db, including WAL mode side files
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# logs
+logs/
+*.log
+
+# secrets (API keys go in env vars or .env, never in committed files)
+.env
+.env.*
+!.env.example
+
+# test and tool caches
+.pytest_cache/
+.coverage
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
