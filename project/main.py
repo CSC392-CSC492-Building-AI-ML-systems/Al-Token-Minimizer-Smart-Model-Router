@@ -7,10 +7,12 @@ from fastapi import FastAPI
 from google import genai
 
 import db
+from gemini_parse import fill_from_error, fill_from_interaction
 from log_setup import setup_logging
 
 load_dotenv()  # reads GEMINI_API_KEY from project/.env (not committed)
 setup_logging()  # writes to project/logs/app.log, see log_setup.py
+db.init_db()  # creates telemetry.db + table if they're not there yet
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
@@ -50,6 +52,21 @@ def ask(prompt: str):
             )
         finally:
             record.latency_upstream_ms = _ms_since(upstream_start)
+        fill_from_interaction(record, interaction)  # tokens, status, ids (gemini_parse.py)
         return {"text": interaction.output_text}
+    except Exception as exc:
+        fill_from_error(record, exc)  # sets status + error fields, then the error still goes out
+        raise
     finally:
         record.latency_total_ms = _ms_since(start)
+        _save(record)
+
+
+def _save(record):
+    """Write the request's row. A db problem is logged, never shown to the user."""
+    try:
+        if record.status is None:  # shouldn't happen, but insert_request needs one
+            record.status = db.STATUS_INTERNAL_ERROR
+        db.insert_request(record)
+    except Exception:
+        logger.exception("Could not save request %s to the db", record.request_id)
