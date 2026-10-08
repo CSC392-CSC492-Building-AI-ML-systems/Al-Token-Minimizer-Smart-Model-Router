@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -18,6 +19,11 @@ if not api_key:
     raise RuntimeError("GEMINI_API_KEY not set, copy .env.example to .env and add your key")
 client = genai.Client(api_key=api_key)
 
+
+def _ms_since(start):
+    return (time.perf_counter() - start) * 1000
+
+
 # NOTE ON KEEPING TRACK OF STUFF TO WRITE TO THE DB:co to keep track of all the different fields before writing to the sqlite for a
 # specific request, use the RequestRecord object (not sure if it's worth having
 # this, maybe just a dict is enough?). it's one record per request, save it once
@@ -29,9 +35,21 @@ client = genai.Client(api_key=api_key)
 #   db.insert_request(record) <-- this actually saves to the sqlite
 @app.get("/ask")
 def ask(prompt: str):
-    logger.info("Prompt sent to gemini-3.5-flash: %r", prompt)
-    interaction = client.interactions.create(
-        model="gemini-3.5-flash",
-        input=prompt,
-    )
-    return {"text": interaction.output_text}
+    start = time.perf_counter()
+    record = db.RequestRecord(endpoint="/ask", model="gemini-3.5-flash")
+    try:
+        # token counting (CSC-6) goes here, timed the same way into
+        # record.latency_count_ms
+
+        logger.info("Prompt sent to gemini-3.5-flash: %r", prompt)
+        upstream_start = time.perf_counter()
+        try:
+            interaction = client.interactions.create(
+                model="gemini-3.5-flash",
+                input=prompt,
+            )
+        finally:
+            record.latency_upstream_ms = _ms_since(upstream_start)
+        return {"text": interaction.output_text}
+    finally:
+        record.latency_total_ms = _ms_since(start)
