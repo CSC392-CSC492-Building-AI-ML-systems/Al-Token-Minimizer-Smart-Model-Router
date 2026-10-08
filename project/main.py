@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from google import genai
 
 import db
-from gemini_parse import fill_from_error, fill_from_interaction
+from gemini_parse import fill_from_error, fill_from_interaction, reply_text
 from log_setup import setup_logging
 
 load_dotenv()  # reads GEMINI_API_KEY from project/.env (not committed)
@@ -55,7 +55,7 @@ def ask(prompt: str):
         finally:
             record.latency_upstream_ms = _ms_since(upstream_start)
         fill_from_interaction(record, interaction)  # tokens, status, ids (gemini_parse.py)
-        return {"text": interaction.output_text}
+        return {"text": reply_text(interaction)}
     except Exception as exc:
         fill_from_error(record, exc)  # sets status + error fields, then the error still goes out
         raise
