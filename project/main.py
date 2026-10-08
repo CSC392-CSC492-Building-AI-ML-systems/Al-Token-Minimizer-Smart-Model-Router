@@ -1,9 +1,11 @@
 import logging
 import os
 import time
+from datetime import datetime
+from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from google import genai
 
 import db
@@ -70,3 +72,18 @@ def _save(record):
         db.insert_request(record)
     except Exception:
         logger.exception("Could not save request %s to the db", record.request_id)
+
+
+@app.get("/telemetry/summary")
+def telemetry_summary(
+    model: str | None = None,
+    # must be one of db.STATUSES, anything else gets a 422
+    status: Annotated[str | None, Query(pattern=f"^({'|'.join(db.STATUSES)})$")] = None,
+    since: datetime | None = None,  # inclusive, UTC if no offset
+    until: datetime | None = None,  # not inclusive
+):
+    """Counts per status, tokens, cost and latency for the stored requests."""
+    try:
+        return db.summarize_requests(model=model, status=status, since=since, until=until)
+    except ValueError as exc:  # since/until can't be converted to UTC (e.g. 0001-01-01T00:00+01:00)
+        raise HTTPException(422, str(exc)) from exc
