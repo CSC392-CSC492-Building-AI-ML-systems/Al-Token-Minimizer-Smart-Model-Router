@@ -20,6 +20,13 @@ import db  # noqa: E402
 import main  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def temp_db(monkeypatch, tmp_path):
+    """/ask saves a row now, so keep these tests out of the real telemetry.db."""
+    monkeypatch.setenv("TELEMETRY_DB_PATH", str(tmp_path / "test.db"))
+    db.init_db()
+
+
 @pytest.fixture
 def records(monkeypatch):
     """Collects every RequestRecord that /ask creates."""
