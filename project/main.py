@@ -1,3 +1,4 @@
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -5,8 +6,11 @@ from fastapi import FastAPI
 from google import genai
 
 import db
+from log_setup import setup_logging
 
 load_dotenv()  # reads GEMINI_API_KEY from project/.env (not committed)
+setup_logging()  # writes to project/logs/app.log, see log_setup.py
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 api_key = os.environ.get("GEMINI_API_KEY")
@@ -25,6 +29,7 @@ client = genai.Client(api_key=api_key)
 #   db.insert_request(record) <-- this actually saves to the sqlite
 @app.get("/ask")
 def ask(prompt: str):
+    logger.info("Prompt sent to gemini-3.5-flash: %r", prompt)
     interaction = client.interactions.create(
         model="gemini-3.5-flash",
         input=prompt,
