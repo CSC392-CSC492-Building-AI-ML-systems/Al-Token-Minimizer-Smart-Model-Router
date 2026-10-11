@@ -7,6 +7,7 @@ Run from the project folder:
     uv run --with pytest pytest tests/test_parsing.py -v
 """
 
+import json
 import os
 from types import SimpleNamespace
 
@@ -16,6 +17,8 @@ import pytest
 os.environ.setdefault("GEMINI_API_KEY", "fake-key-for-tests")  # main.py needs one at import
 
 from fastapi.testclient import TestClient  # noqa: E402
+from google import genai  # noqa: E402
+from google.genai import types  # noqa: E402
 
 import db  # noqa: E402
 import main  # noqa: E402
@@ -163,3 +166,175 @@ def test_db_failure_does_not_break_the_answer(monkeypatch, client):
     response = client.get("/ask", params={"prompt": "hello"})
     assert response.status_code == 200
     assert response.json() == {"text": "Hi, nice to meet you."}
+
+
+# The tests below go through the real SDK, with only Gemini's HTTP API faked, so
+# they get the exact objects and errors the SDK hands main.py (it never lets
+# httpx's own errors out, and it returns a plain dict for a reply that doesn't
+# match its schema).
+
+
+def real_body(**overrides):
+    """A gemini-3.5-flash reply as it comes over the wire."""
+    body = {
+        "id": "v1_abc",
+        "model": "gemini-3.5-flash",
+        "status": "completed",
+        "steps": [
+            {"type": "user_input", "content": [{"type": "text", "text": "hello"}]},
+            {"type": "model_output", "content": [{"type": "text", "text": "Hi, nice to meet you."}]},
+        ],
+        "usage": {"total_input_tokens": 7, "total_output_tokens": 7, "total_tokens": 401},
+    }
+    body.update(overrides)
+    return body
+
+
+def fake_gemini_http(monkeypatch, handler):
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    sdk = genai.Client(api_key="fake", http_options=types.HttpOptions(httpx_client=http))
+    monkeypatch.setattr(main, "client", sdk)
+
+
+def test_real_sdk_good_reply(monkeypatch, client):
+    fake_gemini_http(monkeypatch, lambda request: httpx.Response(200, json=real_body()))
+
+    response = client.get("/ask", params={"prompt": "hello"})
+    [row] = db.fetch_requests()
+
+    assert response.json() == {"text": "Hi, nice to meet you."}
+    assert row["status"] == db.STATUS_OK
+    assert row["interaction_id"] == "v1_abc"
+    assert row["total_tokens"] == 401
+
+
+def test_real_sdk_timeout(monkeypatch, client):
+    def handler(request):
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    fake_gemini_http(monkeypatch, handler)
+    row = ask_and_get_row(client)
+    assert row["status"] == db.STATUS_TIMEOUT
+    assert row["error_type"] == "APITimeoutError"
+
+
+def test_real_sdk_cant_connect(monkeypatch, client):
+    def handler(request):
+        raise httpx.ConnectError("no route", request=request)
+
+    fake_gemini_http(monkeypatch, handler)
+    row = ask_and_get_row(client)
+    assert row["status"] == db.STATUS_CONNECTION_ERROR
+    assert row["error_type"] == "APIConnectionError"
+    assert row["error_message"] == "no route"
+
+
+def test_real_sdk_http_error_keeps_geminis_message(monkeypatch, client):
+    error = {"error": {"code": 400, "message": "Request contains an invalid argument.", "status": "INVALID_ARGUMENT"}}
+    fake_gemini_http(monkeypatch, lambda request: httpx.Response(400, json=error))
+    row = ask_and_get_row(client)
+    assert row["status"] == db.STATUS_UPSTREAM_ERROR
+    assert row["http_status"] == 400
+    assert row["error_type"] == "BadRequestError"
+    assert row["error_message"] == "INVALID_ARGUMENT: Request contains an invalid argument."
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        httpx.Response(200, text=json.dumps(real_body()), headers={"content-type": "text/plain"}),
+        httpx.Response(200, text=json.dumps(real_body())[:-5], headers={"content-type": "application/json"}),
+        httpx.Response(201, json=real_body()),
+    ],
+    ids=["not-json-content-type", "cut-off-json", "201"],
+)
+def test_real_sdk_reply_it_cant_read_isnt_stored(monkeypatch, client, reply):
+    # the SDK's error message has the whole reply (prompt and answer) in it
+    fake_gemini_http(monkeypatch, lambda request: reply)
+    row = ask_and_get_row(client)
+    assert row["status"] == db.STATUS_UPSTREAM_ERROR
+    assert row["http_status"] == reply.status_code
+    assert row["error_message"] is None
+    stored = " ".join(str(v) for v in row.values())
+    assert "hello" not in stored
+    assert "nice to meet you" not in stored
+
+
+def test_real_sdk_reply_without_status(monkeypatch, client):
+    body = real_body()
+    del body["status"]
+    fake_gemini_http(monkeypatch, lambda request: httpx.Response(200, json=body))
+
+    response = client.get("/ask", params={"prompt": "hello"})
+    [row] = db.fetch_requests()
+
+    assert response.status_code == 200
+    assert row["status"] == db.STATUS_NOT_COMPLETED
+    assert row["error_type"] is None
+    assert row["interaction_id"] == "v1_abc"
+    assert row["total_tokens"] == 401  # still read from the dict
+
+
+def test_real_sdk_reply_without_status_or_text(monkeypatch, client):
+    body = real_body(steps=real_body()["steps"][:1])  # only the user's input, no answer
+    del body["status"]
+    fake_gemini_http(monkeypatch, lambda request: httpx.Response(200, json=body))
+
+    response = client.get("/ask", params={"prompt": "hello"})
+
+    assert response.json() == {"text": ""}  # same as for a typed reply with no text
+
+
+TOKEN_FIELDS = {  # Gemini's usage field -> column
+    "total_input_tokens": "input_tokens_reported",
+    "total_output_tokens": "output_tokens",
+    "total_thought_tokens": "thought_tokens",
+    "total_cached_tokens": "cached_tokens",
+    "total_tokens": "total_tokens",
+}
+
+
+@pytest.mark.parametrize("field, column", list(TOKEN_FIELDS.items()))
+def test_real_sdk_token_count_that_isnt_a_number(monkeypatch, client, field, column):
+    usage = {**dict.fromkeys(TOKEN_FIELDS, 7), field: "lots"}
+    fake_gemini_http(monkeypatch, lambda request: httpx.Response(200, json=real_body(usage=usage)))
+
+    response = client.get("/ask", params={"prompt": "hello"})
+    [row] = db.fetch_requests()
+
+    assert response.json() == {"text": "Hi, nice to meet you."}
+    assert row["status"] == db.STATUS_OK
+    assert row[column] is None  # not stored, the summary adds these up
+    assert all(row[other] == 7 for other in TOKEN_FIELDS.values() if other != column)
+    assert db.summarize_requests()["tokens"][column] is None
+
+
+@pytest.mark.parametrize("bad_id", [["v1_abc"], {"id": "v1_abc"}, 5])
+def test_real_sdk_id_that_isnt_a_string(monkeypatch, client, bad_id):
+    # sqlite can't store a list or dict, which would lose the whole row
+    fake_gemini_http(monkeypatch, lambda request: httpx.Response(200, json=real_body(id=bad_id)))
+
+    response = client.get("/ask", params={"prompt": "hello"})
+    [row] = db.fetch_requests()
+
+    assert response.status_code == 200
+    assert row["status"] == db.STATUS_OK
+    assert row["interaction_id"] is None
+    assert row["total_tokens"] == 401
+
+
+@pytest.mark.parametrize(
+    "errors, message",
+    [(5, "5"), ({"code": "RESOURCE_EXHAUSTED", "message": "quota"}, "RESOURCE_EXHAUSTED: quota")],
+    ids=["number", "one-error-not-in-a-list"],
+)
+def test_real_sdk_errors_that_arent_a_list(monkeypatch, client, errors, message):
+    # not a list, so the SDK hands back a dict
+    fake_gemini_http(monkeypatch, lambda request: httpx.Response(200, json=real_body(errors=errors)))
+
+    response = client.get("/ask", params={"prompt": "hello"})
+    [row] = db.fetch_requests()
+
+    assert response.status_code == 200
+    assert row["status"] == db.STATUS_NOT_COMPLETED
+    assert row["error_message"] == message

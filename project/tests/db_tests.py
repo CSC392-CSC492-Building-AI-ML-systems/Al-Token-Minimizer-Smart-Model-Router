@@ -7,6 +7,7 @@ Run from the project folder:
     uv run python -m unittest tests.db_tests -v
 """
 
+import sqlite3
 import unittest
 
 import db
@@ -42,6 +43,25 @@ class TestWriteReadDelete(unittest.TestCase):
 
         self.assertEqual(deleted, 1)
         self.assertEqual(db.fetch_requests(request_id=request_id), [])
+
+
+class TestBadRowsAreRejected(unittest.TestCase):
+    """None of these get as far as writing a row, so the real db is left as it was."""
+
+    def setUp(self):
+        db.init_db()
+
+    def test_status_not_in_the_list(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.insert_request({"status": "great"})
+
+    def test_status_missing(self):
+        with self.assertRaises(ValueError):
+            db.insert_request({"endpoint": "/db-test"})
+
+    def test_unknown_column(self):  # e.g. the raw prompt, which is never stored
+        with self.assertRaises(ValueError):
+            db.insert_request({"status": db.STATUS_OK, "prompt": "hello"})
 
 
 if __name__ == "__main__":
