@@ -24,3 +24,11 @@ uv run fastapi dev
 
 
 go to http://127.0.0.1:8000/docs after running
+
+POST /ask takes a JSON body instead of a query string (use it for long prompts):
+
+{"prompt": "...", "system": "optional system prompt", "compression": "none"}
+
+it returns {"text": ..., "request_id": ...}. compression picks a pipeline from
+compressor/pipeline.py (only "none" exists for now).
+

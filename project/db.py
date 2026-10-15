@@ -46,6 +46,7 @@ COLUMNS = {
     "model": "TEXT",
     "interaction_id": "TEXT",  # Gemini's id for the interaction
     "prompt_hash": "TEXT",  # never the prompt itself
+    "compression": "TEXT",  # name of the compression pipeline used ("none" when off)
     # tokens
     "input_tokens_raw": "INTEGER",  # our count before compression
     "input_tokens_compressed": "INTEGER",  # same as raw until compression exists
@@ -58,6 +59,7 @@ COLUMNS = {
     "latency_total_ms": "REAL",
     "latency_upstream_ms": "REAL",
     "latency_count_ms": "REAL",
+    "latency_compress_ms": "REAL",  # time spent in the compression pipeline
     # outcome
     "status": "TEXT NOT NULL CHECK (status IN (%s))"
     % ", ".join(f"'{s}'" for s in STATUSES),
@@ -82,6 +84,7 @@ LATENCY_COLUMNS = {
     "total": "latency_total_ms",
     "upstream": "latency_upstream_ms",
     "count": "latency_count_ms",
+    "compress": "latency_compress_ms",
 }
 
 SCHEMA = (
@@ -105,6 +108,7 @@ class RequestRecord:
     model: str | None = None
     interaction_id: str | None = None
     prompt_hash: str | None = None
+    compression: str | None = None
     # tokens
     input_tokens_raw: int | None = None
     input_tokens_compressed: int | None = None
@@ -117,6 +121,7 @@ class RequestRecord:
     latency_total_ms: float | None = None
     latency_upstream_ms: float | None = None
     latency_count_ms: float | None = None
+    latency_compress_ms: float | None = None
     # outcome
     status: str | None = None
     http_status: int | None = None
@@ -144,12 +149,20 @@ def get_connection(db_path=None):
 
 
 def init_db(db_path=None):
-    """Create the database file and table if they don't exist, and turn on WAL."""
+    """Create the database file and table if they don't exist, and turn on WAL.
+
+    A db made before a column was added to COLUMNS gets that column added (as
+    NULL for the old rows), so an existing telemetry.db keeps working.
+    """
     path = _resolve_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(get_connection(path)) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(requests)")}
+        for name, sql_type in COLUMNS.items():
+            if name not in existing:  # new columns are plain types, so ADD COLUMN accepts them
+                conn.execute(f"ALTER TABLE requests ADD COLUMN {name} {sql_type}")
         conn.commit()
     return path
 
