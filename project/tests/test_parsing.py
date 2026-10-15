@@ -30,6 +30,12 @@ def temp_db(monkeypatch, tmp_path):
     db.init_db()
 
 
+@pytest.fixture(autouse=True)
+def fake_count(monkeypatch):
+    """Keep /ask's token count off the network (test_latency.py covers it)."""
+    monkeypatch.setattr(main, "_count_tokens", lambda text: 1)
+
+
 @pytest.fixture
 def client():
     return TestClient(main.app, raise_server_exceptions=False)

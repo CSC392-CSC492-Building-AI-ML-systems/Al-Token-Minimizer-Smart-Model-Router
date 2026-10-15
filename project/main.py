@@ -28,6 +28,11 @@ def _ms_since(start):
     return (time.perf_counter() - start) * 1000
 
 
+def _count_tokens(text):
+    """Our own count of the prompt before it's sent (CSC-6), via Gemini's count_tokens."""
+    return client.models.count_tokens(model="gemini-3.5-flash", contents=text).total_tokens
+
+
 # NOTE ON KEEPING TRACK OF STUFF TO WRITE TO THE DB:co to keep track of all the different fields before writing to the sqlite for a
 # specific request, use the RequestRecord object (not sure if it's worth having
 # this, maybe just a dict is enough?). it's one record per request, save it once
@@ -42,8 +47,14 @@ def ask(prompt: str):
     start = time.perf_counter()
     record = db.RequestRecord(endpoint="/ask", model="gemini-3.5-flash")
     try:
-        # token counting (CSC-6) goes here, timed the same way into
-        # record.latency_count_ms
+        count_start = time.perf_counter()
+        try:
+            record.input_tokens_raw = _count_tokens(prompt)
+        except Exception:
+            # the count is only for telemetry, so a failure here shouldn't block the reply
+            logger.exception("Could not count tokens for request %s", record.request_id)
+        finally:
+            record.latency_count_ms = _ms_since(count_start)
 
         logger.info("Prompt sent to gemini-3.5-flash: %r", prompt)
         upstream_start = time.perf_counter()
