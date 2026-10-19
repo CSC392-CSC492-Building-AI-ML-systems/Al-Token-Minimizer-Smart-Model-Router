@@ -239,6 +239,16 @@ def test_real_sdk_http_error_keeps_geminis_message(monkeypatch, client):
     assert row["error_message"] == "INVALID_ARGUMENT: Request contains an invalid argument."
 
 
+def test_real_sdk_http_error_in_a_list_keeps_geminis_message(monkeypatch, client):
+    # the shape a project with no prepaid credits left gets back (message shortened)
+    error = [{"error": {"code": 402, "message": "Your prepayment credits are depleted.", "status": "RESOURCE_EXHAUSTED"}}]
+    fake_gemini_http(monkeypatch, lambda request: httpx.Response(402, json=error))
+    row = ask_and_get_row(client)
+    assert row["status"] == db.STATUS_UPSTREAM_ERROR
+    assert row["http_status"] == 402
+    assert row["error_message"] == "RESOURCE_EXHAUSTED: Your prepayment credits are depleted."
+
+
 @pytest.mark.parametrize(
     "reply",
     [

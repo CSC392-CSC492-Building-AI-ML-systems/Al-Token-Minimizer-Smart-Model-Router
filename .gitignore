@@ -9,6 +9,9 @@ __pycache__/
 *.db-shm
 *.db-journal
 
+# benchmark runs (replies, per-run db and reports)
+project/benchmark/results/
+
 # logs
 logs/
 *.log

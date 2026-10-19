@@ -24,3 +24,22 @@ uv run fastapi dev
 
 
 go to http://127.0.0.1:8000/docs after running
+
+POST /ask takes a JSON body instead of a query string (use it for long prompts):
+
+{"prompt": "...", "system": "optional system prompt", "compression": "none"}
+
+it returns {"text": ..., "request_id": ...}. compression picks a pipeline from
+compressor/pipeline.py (only "none" exists for now).
+
+
+BENCHMARK
+
+from the project folder:
+
+uv run python -m benchmark run                            (baseline, 30 calls)
+uv run python -m benchmark run --repeats 1                (barebones, 10 calls)
+uv run python -m benchmark run --pipelines <EVENTUAL PIPELINE STAGE HERE> <EVENTUAL PIPELINE OTHER STAGE>    (compare with a pipeline)
+
+results go in benchmark/results/<time>/report.md. --help for all options.
+For reading the .md file VS code should be able to render the table in markdown if you righclick on the file and click Open preview 

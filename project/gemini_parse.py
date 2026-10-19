@@ -96,8 +96,12 @@ def fill_from_error(record, exc):
         record.status = db.STATUS_UPSTREAM_ERROR
         record.http_status = status_code
         # its message has the whole response body in it, which for a 2xx is the
-        # answer itself, so only keep Gemini's own error ({"error": {...}}) if there is one
-        error = _get(getattr(exc, "body", None), "error")
+        # answer itself, so only keep Gemini's own error ({"error": {...}}) if there is one.
+        # Some errors (e.g. 402 out of prepaid credits) come wrapped in a list: [{"error": {...}}]
+        body = getattr(exc, "body", None)
+        if isinstance(body, list) and body:
+            body = body[0]
+        error = _get(body, "error")
         record.error_message = _short(_join(_get(error, "status"), _get(error, "message")))
     else:
         record.status = db.STATUS_INTERNAL_ERROR
