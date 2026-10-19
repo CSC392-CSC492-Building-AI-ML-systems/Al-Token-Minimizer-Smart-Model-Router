@@ -15,5 +15,5 @@ class Compressor:
         """
 
         # For testing purposes
-        return self.text + "test"
+        return self.text
     

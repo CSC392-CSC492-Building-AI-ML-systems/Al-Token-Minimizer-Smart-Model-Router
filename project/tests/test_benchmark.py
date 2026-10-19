@@ -27,6 +27,11 @@ def temp_db(monkeypatch, tmp_path):
     db.init_db()
 
 
+@pytest.fixture(autouse=True)
+def fake_token_counter(monkeypatch):
+    monkeypatch.setattr(main.model_package.tokenizer, "count", lambda text: len(text.split()))
+
+
 # ---------------------------------------------------------------- cases
 
 

@@ -27,6 +27,11 @@ def temp_db(monkeypatch, tmp_path):
     db.init_db()
 
 
+@pytest.fixture(autouse=True)
+def fake_token_counter(monkeypatch):
+    monkeypatch.setattr(main.model_package.tokenizer, "count", lambda text: len(text.split()))
+
+
 @pytest.fixture
 def client():
     return TestClient(main.app, raise_server_exceptions=False)
@@ -75,6 +80,9 @@ def test_post_ask_returns_text_and_saves_row(monkeypatch, client):
     assert row["status"] == db.STATUS_OK
     assert row["compression"] == "none"
     assert row["latency_compress_ms"] >= 0
+    assert row["latency_count_ms"] >= 0
+    assert row["input_tokens_raw"] == 1
+    assert row["input_tokens_compressed"] == 1
     assert row["input_tokens_reported"] == 12
 
 

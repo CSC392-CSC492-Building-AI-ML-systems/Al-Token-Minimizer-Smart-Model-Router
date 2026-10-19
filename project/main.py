@@ -11,8 +11,11 @@ from pydantic import BaseModel, field_validator
 
 import db
 from compressor import pipeline
+from compressor.compressor_service import CompressorService
 from gemini_parse import fill_from_error, fill_from_interaction, reply_text
 from log_setup import setup_logging
+from model_data.model_package import ModelPackage
+from model_data.token_counter import GeminiTokenCounter
 
 load_dotenv()  # reads GEMINI_API_KEY from project/.env (not committed)
 setup_logging()  # writes to project/logs/app.log, see log_setup.py
@@ -25,6 +28,7 @@ if not api_key:
     raise RuntimeError("GEMINI_API_KEY not set, copy .env.example to .env and add your key")
 client = genai.Client(api_key=api_key)
 MODEL = "gemini-3.5-flash"
+model_package = ModelPackage(pricing=None, tokenizer=GeminiTokenCounter(client))
 
 
 def _ms_since(start):
@@ -92,15 +96,21 @@ def _answer(record, prompt, compression=pipeline.DEFAULT_PIPELINE):
     start = time.perf_counter()
     record.compression = compression
     try:
-        # token counting (CSC-6) goes here, timed the same way into
-        # record.latency_count_ms
-
         compress_start = time.perf_counter()
         try:
-            prompt = pipeline.compress(prompt, compression)
+            compressor_service = CompressorService(prompt, model_package, pipeline=compression)
         finally:
             record.latency_compress_ms = _ms_since(compress_start)
 
+        count_start = time.perf_counter()
+        try:
+            token_info = compressor_service.get_token_information()
+            record.input_tokens_raw = token_info["uncompressed_input_tokens"]
+            record.input_tokens_compressed = token_info["compressed_input_tokens"]
+        finally:
+            record.latency_count_ms = _ms_since(count_start)
+
+        prompt = compressor_service.compressed_prompt
         logger.info("Prompt sent to %s: %r", MODEL, prompt.text)
         kwargs = {"model": MODEL, "input": prompt.text}
         if prompt.system is not None:

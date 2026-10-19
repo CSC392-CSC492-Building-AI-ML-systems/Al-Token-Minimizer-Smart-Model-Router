@@ -1,5 +1,5 @@
 from model_data.model_package import ModelPackage
-from compressor.compressor import Compressor
+from compressor.pipeline import DEFAULT_PIPELINE, Prompt, compress
 
 class CompressorService:
     """
@@ -7,15 +7,27 @@ class CompressorService:
 
     """
     input_text: str
-    output_text:str
+    output_text: str | None
     compressed_text: str
     model_package: ModelPackage
+    pipeline: str
 
-    def __init__(self, input: str, model_package: ModelPackage, output:str=None):
-        self.input_text = input
+    def __init__(
+        self,
+        prompt: Prompt | str,
+        model_package: ModelPackage,
+        output: str | None = None,
+        pipeline: str = DEFAULT_PIPELINE,
+    ):
+        original_prompt = prompt if isinstance(prompt, Prompt) else Prompt(prompt)
+        compressed_prompt = compress(original_prompt, pipeline)
+
+        self.input_text = original_prompt.text
         self.output_text = output
         self.model_package = model_package
-        self.compressed_text = Compressor(input).compress() # May change this later, depends on how we deal with compression
+        self.pipeline = pipeline
+        self.compressed_prompt = compressed_prompt
+        self.compressed_text = compressed_prompt.text
 
     def get_text_information(self):
         return {
@@ -59,6 +71,8 @@ class CompressorService:
         """
 
         pricing = self.model_package.pricing
+        if pricing is None:
+            raise ValueError("Model pricing is not configured")
         tokens = self.get_token_information()
         output = self.output_text
 

@@ -14,6 +14,5 @@ class ModelPackage:
     pricing: The relevant pricing for this model.
     tokenizer: A model specific token counter 
     """
-    pricing: ModelPricing
+    pricing: ModelPricing | None
     tokenizer: TokenCounter
-

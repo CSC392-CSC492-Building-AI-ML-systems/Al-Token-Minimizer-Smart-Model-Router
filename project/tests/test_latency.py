@@ -27,6 +27,11 @@ def temp_db(monkeypatch, tmp_path):
     db.init_db()
 
 
+@pytest.fixture(autouse=True)
+def fake_token_counter(monkeypatch):
+    monkeypatch.setattr(main.model_package.tokenizer, "count", lambda text: len(text.split()))
+
+
 @pytest.fixture
 def records(monkeypatch):
     """Collects every RequestRecord that /ask creates."""
@@ -78,8 +83,7 @@ def test_gemini_error_still_sets_latency(monkeypatch, records, client):
     assert record.latency_total_ms >= record.latency_upstream_ms
 
 
-def test_count_latency_not_set_yet(monkeypatch, records, client):
-    # filled in once token counting (CSC-6) lands in /ask
+def test_count_latency_and_tokens_are_recorded(monkeypatch, records, client):
     monkeypatch.setattr(
         main.client.interactions, "create", lambda model, input: SimpleNamespace(output_text="hi")
     )
@@ -87,4 +91,6 @@ def test_count_latency_not_set_yet(monkeypatch, records, client):
     client.get("/ask", params={"prompt": "hello"})
 
     [record] = records
-    assert record.latency_count_ms is None
+    assert record.latency_count_ms >= 0
+    assert record.input_tokens_raw == 1
+    assert record.input_tokens_compressed == 1
