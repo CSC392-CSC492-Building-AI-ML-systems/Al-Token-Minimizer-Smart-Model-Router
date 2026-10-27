@@ -47,20 +47,20 @@ def _ms_since(start):
 @app.get("/ask")
 def ask(prompt: str):
     record = db.RequestRecord(endpoint="/ask", model=MODEL)
-    return {"text": _answer(record, pipeline.Prompt(prompt))}
+    return {"text": _answer(record, pipeline.Prompt(prompt), [])}
 
 
 class AskRequest(BaseModel):
     prompt: str
     system: str | None = None  # sent as Gemini's system_instruction
-    compression: str = pipeline.DEFAULT_PIPELINE  # a name from compressor.pipeline.PIPELINES
+    stages: list[str] = []  # compression stages to run, in order (names from compressor/stages/)
 
-    @field_validator("compression")
+    @field_validator("stages")
     @classmethod
-    def _known_pipeline(cls, name):
-        if name not in pipeline.PIPELINES:
-            raise ValueError(f"must be one of {sorted(pipeline.PIPELINES)}")
-        return name
+    def _known_stages(cls, stages):
+        if unknown := pipeline.unknown_stages(stages):
+            raise ValueError(f"unknown stages {unknown}, expected some of {sorted(pipeline.STAGES)}")
+        return stages
 
 
 # HTTP code POST /ask answers with when the request fails, by db status.
@@ -76,29 +76,36 @@ _HTTP_FOR_STATUS = {
 
 @app.post("/ask")
 def ask_post(body: AskRequest):
-    """Like GET /ask, but takes a system prompt and a compression pipeline, and
+    """Like GET /ask, but takes a system prompt and the compression stages to run, and
     returns the request_id of the row saved for it (also on failure, in `detail`)."""
     record = db.RequestRecord(endpoint="/ask", model=MODEL)
     try:
-        text = _answer(record, pipeline.Prompt(body.prompt, body.system), body.compression)
+        text = _answer(record, pipeline.Prompt(body.prompt, body.system), body.stages)
     except Exception:
         code = 429 if record.http_status == 429 else _HTTP_FOR_STATUS.get(record.status, 500)
         raise HTTPException(code, {"status": record.status, "request_id": record.request_id}) from None
     return {"text": text, "request_id": record.request_id}
 
 
-def _answer(record, prompt, compression=pipeline.DEFAULT_PIPELINE):
+def _answer(record: db.RequestRecord, prompt: pipeline.Prompt, stages: list[str]) -> str:
     """Compress the prompt, send it to Gemini and return the reply text.
 
-    Fills `record` along the way and saves it at the end, also when something
-    raises (the error is re-raised after that).
+    `stages` are the names of the compression stages to run, in order, e.g.
+    ["passthrough"]; an empty list sends the prompt unchanged. Fills
+    `record` along the way and saves it at the end, also when something raises
+    (the error is re-raised after that).
     """
     start = time.perf_counter()
-    record.compression = compression
+    record.compression = pipeline.label(stages)  # e.g. "a+b", "none" for no stages
     try:
+        # Run the stages the request listed, in order. Each stage takes the
+        # Prompt and returns a new, shorter one. E.g. with
+        # {"stages": ["passthrough"]} this calls passthrough
+        # (compressor/stages/example.py), which hands the prompt back as is; a
+        # real stage would shorten it here. No stages sends the prompt unchanged.
         compress_start = time.perf_counter()
         try:
-            compressor_service = CompressorService(prompt, model_package, pipeline=compression)
+            compressor_service = CompressorService(prompt, model_package, stages=stages)
         finally:
             record.latency_compress_ms = _ms_since(compress_start)
 
@@ -111,8 +118,8 @@ def _answer(record, prompt, compression=pipeline.DEFAULT_PIPELINE):
             record.latency_count_ms = _ms_since(count_start)
 
         prompt = compressor_service.compressed_prompt
-        logger.info("Prompt sent to %s: %r", MODEL, prompt.text)
-        kwargs = {"model": MODEL, "input": prompt.text}
+        logger.info("Prompt sent to %s: %r", MODEL, prompt.render())
+        kwargs = {"model": MODEL, "input": prompt.render()}
         if prompt.system is not None:
             kwargs["system_instruction"] = prompt.system
         upstream_start = time.perf_counter()

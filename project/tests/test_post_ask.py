@@ -95,8 +95,8 @@ def test_post_ask_without_system_doesnt_send_one(monkeypatch, client):
     assert "system_instruction" not in sent
 
 
-def test_post_ask_rejects_unknown_pipeline(client):
-    response = client.post("/ask", json={"prompt": "hello", "compression": "zip"})
+def test_post_ask_rejects_unknown_stages(client):
+    response = client.post("/ask", json={"prompt": "hello", "stages": ["zip"]})
 
     assert response.status_code == 422
     assert db.fetch_requests() == []
@@ -117,22 +117,22 @@ def test_post_ask_failure_still_gives_request_id(monkeypatch, client):
     assert row["http_status"] == 429
 
 
-def test_post_ask_runs_the_pipeline(monkeypatch, client):
+def test_post_ask_runs_the_stages(monkeypatch, client):
     sent = {}
     monkeypatch.setitem(pipeline.STAGES, "shout", lambda p: pipeline.Prompt(p.text.upper(), p.system))
-    monkeypatch.setitem(pipeline.PIPELINES, "loud", ("shout",))
+    monkeypatch.setitem(pipeline.STAGES, "exclaim", lambda p: pipeline.Prompt(p.text + "!", p.system))
     monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
 
-    response = client.post("/ask", json={"prompt": "hello", "compression": "loud"})
+    response = client.post("/ask", json={"prompt": "hello", "stages": ["shout", "exclaim"]})
 
-    assert sent["input"] == "HELLO"
+    assert sent["input"] == "HELLO!"
     [row] = db.fetch_requests(request_id=response.json()["request_id"])
-    assert row["compression"] == "loud"
+    assert row["compression"] == "shout+exclaim"
 
 
-def test_unknown_pipeline_raises():
+def test_unknown_stage_raises():
     with pytest.raises(ValueError):
-        pipeline.compress(pipeline.Prompt("hi"), "nope")
+        pipeline.compress(pipeline.Prompt("hi"), ["nope"])
 
 
 # ---------------------------------------------------------------- db migration

@@ -1,8 +1,8 @@
 """Run the compression benchmark, grade the replies and write a report.
 
 From the project folder:
-    uv run python -m benchmark run                      # baseline: every test 3 times, pipeline "none"
-    uv run python -m benchmark run --pipelines none light --repeats 5
+    uv run python -m benchmark run                      # baseline: every test 3 times, no stages ("none")
+    uv run python -m benchmark run --stages none a a+b --repeats 5   # compare no stages, stage a, and a then b
     uv run python -m benchmark run --tests orders_json verbose_json --repeats 1
     uv run python -m benchmark grade benchmark/results/<run>   # re-grade (e.g. after changing a check)
     uv run python -m benchmark report benchmark/results/<run>  # rebuild the report
@@ -18,7 +18,9 @@ benchmark/results/ (gitignored), e.g. benchmark/results/2026-10-15_03-14-44/:
 
 Requests go through POST /ask in this process (FastAPI's TestClient), so they
 take the same path as real traffic, compression and telemetry included,
-without needing the server running. Each repeat runs every (test, pipeline)
+without needing the server running. A "pipeline" here is a combination of
+compression stages written as a label: "none", "a" or "a+b" (stage a, then b).
+Each repeat runs every (test, pipeline)
 pair in a shuffled order, so pipelines are compared under the same Gemini load
 instead of one after the other.
 """
@@ -41,7 +43,7 @@ from benchmark.judge import judge
 from compressor import pipeline as compression
 
 RESULTS_DIR = Path(__file__).parent / "results"
-BASELINE = compression.DEFAULT_PIPELINE
+BASELINE = "none"  # no stages; every other combination is compared against it
 
 # Copied from the request's db row into results.jsonl.
 ROW_COLUMNS = (
@@ -66,9 +68,9 @@ RETRY_STATUSES = {"timeout", "connection_error"}
 
 
 def run(args):
-    unknown = set(args.pipelines) - set(compression.PIPELINES)
+    unknown = {s for name in args.pipelines for s in compression.unknown_stages(compression.parse_label(name))}
     if unknown:
-        sys.exit(f"unknown pipelines {sorted(unknown)}, expected some of {sorted(compression.PIPELINES)}")
+        sys.exit(f"unknown stages {sorted(unknown)}, expected some of {sorted(compression.STAGES)}")
 
     out = RESULTS_DIR / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # local time
     out.mkdir(parents=True, exist_ok=False)
@@ -136,7 +138,7 @@ def run(args):
 
 def _call(client, db, case, pipeline_name, args):
     """POST the case to /ask, retrying rate limits and timeouts. Returns the results.jsonl fields."""
-    body = {"prompt": case.prompt, "system": case.system, "compression": pipeline_name}
+    body = {"prompt": case.prompt, "system": case.system, "stages": compression.parse_label(pipeline_name)}
     for attempt in range(1, args.retries + 2):
         response = client.post("/ask", json=body)
         payload = response.json()
@@ -385,10 +387,10 @@ def cli(argv=None):
     run_parser.add_argument("--tests", nargs="+", choices=list(case_lib.TESTS), default=list(case_lib.TESTS),
                             help="tests to run (default: all, see `list`)")
     add_grade_args(run_parser)
-    run_parser.add_argument("--pipelines", nargs="+", default=[BASELINE],
-                            help=f"compression pipelines to compare (default: {BASELINE}; "
-                                 f"available: {', '.join(compression.PIPELINES)})")
-    run_parser.add_argument("--repeats", type=int, default=3, help="times each test is sent per pipeline (default 3)")
+    run_parser.add_argument("--stages", dest="pipelines", metavar="COMBO", nargs="+", default=[BASELINE],
+                            help=f"stage combinations to compare, e.g. none a a+b (default: {BASELINE}; "
+                                 f"stages: {', '.join(sorted(compression.STAGES))})")
+    run_parser.add_argument("--repeats", type=int, default=3, help="times each test is sent per combination (default 3)")
     run_parser.add_argument("--seed", type=int, default=0, help="seed for the call order (default 0)")
     run_parser.add_argument("--delay", type=float, default=0, help="seconds to wait between calls (default 0)")
     run_parser.add_argument("--retries", type=int, default=3, help="retries for 429/5xx/timeouts (default 3)")

@@ -1,5 +1,5 @@
 from model_data.model_package import ModelPackage
-from compressor.pipeline import DEFAULT_PIPELINE, Prompt, compress
+from compressor.pipeline import Prompt, compress
 
 class CompressorService:
     """
@@ -10,24 +10,25 @@ class CompressorService:
     output_text: str | None
     compressed_text: str
     model_package: ModelPackage
-    pipeline: str
+    stages: list[str]
 
     def __init__(
         self,
         prompt: Prompt | str,
         model_package: ModelPackage,
         output: str | None = None,
-        pipeline: str = DEFAULT_PIPELINE,
+        stages=(),
     ):
         original_prompt = prompt if isinstance(prompt, Prompt) else Prompt(prompt)
-        compressed_prompt = compress(original_prompt, pipeline)
+        compressed_prompt = compress(original_prompt, stages)
 
-        self.input_text = original_prompt.text
+        # render(): the text actually sent, knowledge-base chunks included
+        self.input_text = original_prompt.render()
         self.output_text = output
         self.model_package = model_package
-        self.pipeline = pipeline
+        self.stages = list(stages)
         self.compressed_prompt = compressed_prompt
-        self.compressed_text = compressed_prompt.text
+        self.compressed_text = compressed_prompt.render()
 
     def get_text_information(self):
         return {

@@ -46,7 +46,7 @@ COLUMNS = {
     "model": "TEXT",
     "interaction_id": "TEXT",  # Gemini's id for the interaction
     "prompt_hash": "TEXT",  # never the prompt itself
-    "compression": "TEXT",  # name of the compression pipeline used ("none" when off)
+    "compression": "TEXT",  # compression stages used, e.g. "a+b" ("none" when off), see pipeline.label()
     # tokens
     "input_tokens_raw": "INTEGER",  # our count before compression
     "input_tokens_compressed": "INTEGER",  # same as raw until compression exists
