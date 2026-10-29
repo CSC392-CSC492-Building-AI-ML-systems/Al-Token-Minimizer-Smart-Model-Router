@@ -47,6 +47,7 @@ COLUMNS = {
     "interaction_id": "TEXT",  # Gemini's id for the interaction
     "prompt_hash": "TEXT",  # never the prompt itself
     "compression": "TEXT",  # compression stages used, e.g. "a+b" ("none" when off), see pipeline.label()
+    "cache_hit": "TEXT",  # "semantic" when the answer came from the cache (Gemini not called), else NULL
     # tokens
     "input_tokens_raw": "INTEGER",  # our count before compression
     "input_tokens_compressed": "INTEGER",  # same as raw until compression exists
@@ -60,6 +61,7 @@ COLUMNS = {
     "latency_upstream_ms": "REAL",
     "latency_count_ms": "REAL",
     "latency_compress_ms": "REAL",  # time spent in the compression pipeline
+    "latency_cache_ms": "REAL",  # time spent looking up the semantic cache
     # outcome
     "status": "TEXT NOT NULL CHECK (status IN (%s))"
     % ", ".join(f"'{s}'" for s in STATUSES),
@@ -85,6 +87,7 @@ LATENCY_COLUMNS = {
     "upstream": "latency_upstream_ms",
     "count": "latency_count_ms",
     "compress": "latency_compress_ms",
+    "cache": "latency_cache_ms",
 }
 
 SCHEMA = (
@@ -109,6 +112,7 @@ class RequestRecord:
     interaction_id: str | None = None
     prompt_hash: str | None = None
     compression: str | None = None
+    cache_hit: str | None = None
     # tokens
     input_tokens_raw: int | None = None
     input_tokens_compressed: int | None = None
@@ -122,6 +126,7 @@ class RequestRecord:
     latency_upstream_ms: float | None = None
     latency_count_ms: float | None = None
     latency_compress_ms: float | None = None
+    latency_cache_ms: float | None = None
     # outcome
     status: str | None = None
     http_status: int | None = None
@@ -275,7 +280,7 @@ def summarize_requests(db_path=None, model=None, status=None, since=None, until=
     numbers for each model, sorted by name, with rows that have no model last.
     """
     where, params = _where_clause(model=model, status=status, since=since, until=until)
-    columns = ["model", "timestamp", "status", "cost_usd", *TOKEN_COLUMNS, *LATENCY_COLUMNS.values()]
+    columns = ["model", "timestamp", "status", "cost_usd", "cache_hit", *TOKEN_COLUMNS, *LATENCY_COLUMNS.values()]
     sql = f"SELECT {', '.join(columns)} FROM requests{where}"
 
     overall, per_model = _Totals(), {}
@@ -306,6 +311,8 @@ class _Totals:
         self.cost = None
         self.priced_requests = 0
         self.latencies = {name: [] for name in LATENCY_COLUMNS}
+        self.cache_checked = 0  # requests that looked in the cache (not sent with cache: false)
+        self.cache_hits = 0
 
     def add(self, row):
         self.requests += 1
@@ -331,6 +338,10 @@ class _Totals:
             if row[column] is not None:
                 self.latencies[name].append(row[column])
 
+        if row["latency_cache_ms"] is not None:
+            self.cache_checked += 1
+            self.cache_hits += row["cache_hit"] is not None
+
     def summary(self):
         return {
             "requests": self.requests,
@@ -342,6 +353,11 @@ class _Totals:
             "compression": {
                 "tokens_saved": self.tokens_saved,
                 "saved_rate": _ratio(self.tokens_saved, self.raw_tokens_compressed),
+            },
+            "cache": {
+                "checked": self.cache_checked,
+                "hits": self.cache_hits,
+                "hit_rate": _ratio(self.cache_hits, self.cache_checked),
             },
             "cost_usd": {
                 "total": self.cost,
@@ -390,7 +406,7 @@ def format_summary(summary):
     if not summary["requests"]:
         return "No requests stored (for these filters)."
 
-    cost, compression = summary["cost_usd"], summary["compression"]
+    cost, compression, cache = summary["cost_usd"], summary["compression"], summary["cache"]
     statuses = ", ".join(f"{name} {count:,}" for name, count in summary["status_counts"].items() if count)
     lines = [
         f"requests      {summary['requests']:,}  "
@@ -401,6 +417,8 @@ def format_summary(summary):
         f"{cost['unpriced_requests']:,} unpriced",
         f"compression   {_fmt_num(compression['tokens_saved'])} input tokens saved "
         f"({_fmt_pct(compression['saved_rate'])})",
+        f"cache         {_fmt_pct(cache['hit_rate'])} hit rate "
+        f"({cache['hits']:,} of {cache['checked']:,} requests that checked the cache)",
         "",
         "tokens",
     ]

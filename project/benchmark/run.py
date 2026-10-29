@@ -138,7 +138,8 @@ def run(args):
 
 def _call(client, db, case, pipeline_name, args):
     """POST the case to /ask, retrying rate limits and timeouts. Returns the results.jsonl fields."""
-    body = {"prompt": case.prompt, "system": case.system, "stages": compression.parse_label(pipeline_name)}
+    # no cache: every repeat has to reach Gemini, or the repeats would just be cache hits
+    body = {"prompt": case.prompt, "system": case.system, "stages": compression.parse_label(pipeline_name), "cache": False}
     for attempt in range(1, args.retries + 2):
         response = client.post("/ask", json=body)
         payload = response.json()

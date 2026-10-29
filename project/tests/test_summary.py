@@ -130,6 +130,24 @@ def test_success_rate_only_counts_ok(db_path):
     assert summary["success_rate"] == pytest.approx(1 / len(db.STATUSES))
 
 
+def test_cache_hit_rate_only_counts_requests_that_checked_the_cache(db_path):
+    add(db_path, cache_hit="semantic", latency_cache_ms=20)
+    add(db_path, latency_cache_ms=15)  # checked, missed
+    add(db_path, latency_cache_ms=15)
+    add(db_path)  # sent with cache: false
+
+    summary = db.summarize_requests(db_path)
+
+    assert summary["cache"] == {"checked": 3, "hits": 1, "hit_rate": pytest.approx(1 / 3)}
+    assert summary["latency_ms"]["cache"]["max"] == 20
+
+
+def test_cache_hit_rate_is_none_when_nothing_checked(db_path):
+    add(db_path)
+
+    assert db.summarize_requests(db_path)["cache"] == {"checked": 0, "hits": 0, "hit_rate": None}
+
+
 @pytest.mark.parametrize(
     "values",
     [[42.0], [10.0, 20.0], [5.0, 1.0, 3.0, 2.0, 4.0], [float(v * v % 97) for v in range(1, 60)]],

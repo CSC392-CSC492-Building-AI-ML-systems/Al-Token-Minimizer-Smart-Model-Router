@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated
 
@@ -10,6 +11,7 @@ from google import genai
 from pydantic import BaseModel, field_validator
 
 import db
+from cache import semantic
 from compressor import pipeline
 from compressor.compressor_service import CompressorService
 from gemini_parse import fill_from_error, fill_from_interaction, reply_text
@@ -22,7 +24,20 @@ setup_logging()  # writes to project/logs/app.log, see log_setup.py
 db.init_db()  # creates telemetry.db + table if they're not there yet
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+
+
+@asynccontextmanager
+async def lifespan(app):
+    """Runs when the server starts: loads the semantic cache's embedding model
+    (a few seconds), so the first request doesn't wait for it."""
+    try:
+        semantic.warm_up()
+    except Exception:
+        logger.exception("Semantic cache not ready (is Redis running? docker compose up -d), requests will skip it")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
     raise RuntimeError("GEMINI_API_KEY not set, copy .env.example to .env and add your key")
@@ -54,6 +69,7 @@ class AskRequest(BaseModel):
     prompt: str
     system: str | None = None  # sent as Gemini's system_instruction
     stages: list[str] = []  # compression stages to run, in order (names from compressor/stages/)
+    cache: bool = True  # False skips the semantic cache, e.g. for the benchmark
 
     @field_validator("stages")
     @classmethod
@@ -80,24 +96,36 @@ def ask_post(body: AskRequest):
     returns the request_id of the row saved for it (also on failure, in `detail`)."""
     record = db.RequestRecord(endpoint="/ask", model=MODEL)
     try:
-        text = _answer(record, pipeline.Prompt(body.prompt, body.system), body.stages)
+        text = _answer(record, pipeline.Prompt(body.prompt, body.system), body.stages, body.cache)
     except Exception:
         code = 429 if record.http_status == 429 else _HTTP_FOR_STATUS.get(record.status, 500)
         raise HTTPException(code, {"status": record.status, "request_id": record.request_id}) from None
     return {"text": text, "request_id": record.request_id}
 
 
-def _answer(record: db.RequestRecord, prompt: pipeline.Prompt, stages: list[str]) -> str:
+def _answer(record: db.RequestRecord, prompt: pipeline.Prompt, stages: list[str], cache: bool = True) -> str:
     """Compress the prompt, send it to Gemini and return the reply text.
 
     `stages` are the names of the compression stages to run, in order, e.g.
-    ["passthrough"]; an empty list sends the prompt unchanged. Fills
-    `record` along the way and saves it at the end, also when something raises
-    (the error is re-raised after that).
+    ["passthrough"]; an empty list sends the prompt unchanged. With `cache`, a
+    prompt that means the same as an earlier one gets that answer back without
+    calling Gemini, and a new answer is saved for next time. Fills `record`
+    along the way and saves it at the end, also when something raises (the
+    error is re-raised after that).
     """
     start = time.perf_counter()
     record.compression = pipeline.label(stages)  # e.g. "a+b", "none" for no stages
+    original_prompt = prompt  # the cache works on the prompt before compression
     try:
+        if cache:
+            cache_start = time.perf_counter()
+            cached = _cache_lookup(original_prompt)
+            record.latency_cache_ms = _ms_since(cache_start)
+            if cached is not None:
+                record.cache_hit = "semantic"
+                record.status = db.STATUS_OK
+                return cached
+
         # Run the stages the request listed, in order. Each stage takes the
         # Prompt and returns a new, shorter one. E.g. with
         # {"stages": ["passthrough"]} this calls passthrough
@@ -128,13 +156,34 @@ def _answer(record: db.RequestRecord, prompt: pipeline.Prompt, stages: list[str]
         finally:
             record.latency_upstream_ms = _ms_since(upstream_start)
         fill_from_interaction(record, interaction)  # tokens, status, ids (gemini_parse.py)
-        return reply_text(interaction)
+        text = reply_text(interaction)
+        if cache and record.status == db.STATUS_OK:
+            _cache_store(original_prompt, text)
+        return text
     except Exception as exc:
         fill_from_error(record, exc)  # sets status + error fields, then the error still goes out
         raise
     finally:
         record.latency_total_ms = _ms_since(start)
         _save(record)
+
+
+def _cache_lookup(prompt):
+    """The cached answer, or None. A cache problem (e.g. Redis not running) is
+    logged and counts as a miss, so the request still goes to Gemini."""
+    try:
+        return semantic.lookup(prompt, MODEL)
+    except Exception:
+        logger.exception("Semantic cache lookup failed")
+        return None
+
+
+def _cache_store(prompt, text):
+    """Save the answer in the cache. A cache problem is logged, never shown to the user."""
+    try:
+        semantic.store(prompt, MODEL, text)
+    except Exception:
+        logger.exception("Could not save the answer to the semantic cache")
 
 
 def _save(record):
