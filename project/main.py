@@ -10,6 +10,7 @@ from google import genai
 from pydantic import BaseModel, field_validator
 
 import db
+import cache
 from compressor import pipeline
 from compressor.compressor_service import CompressorService
 from gemini_parse import fill_from_error, fill_from_interaction, reply_text
@@ -20,6 +21,7 @@ from model_data.token_counter import GeminiTokenCounter
 load_dotenv()  # reads GEMINI_API_KEY from project/.env (not committed)
 setup_logging()  # writes to project/logs/app.log, see log_setup.py
 db.init_db()  # creates telemetry.db + table if they're not there yet
+cache.init_cache() # create cache
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
@@ -54,6 +56,7 @@ class AskRequest(BaseModel):
     prompt: str
     system: str | None = None  # sent as Gemini's system_instruction
     stages: list[str] = []  # compression stages to run, in order (names from compressor/stages/)
+    use_cache: bool = True # for testing and opt out option to be implemented with the ui
 
     @field_validator("stages")
     @classmethod
@@ -80,14 +83,15 @@ def ask_post(body: AskRequest):
     returns the request_id of the row saved for it (also on failure, in `detail`)."""
     record = db.RequestRecord(endpoint="/ask", model=MODEL)
     try:
-        text = _answer(record, pipeline.Prompt(body.prompt, body.system), body.stages)
+        text = _answer(record, pipeline.Prompt(body.prompt, body.system), body.stages, body.use_cache)
     except Exception:
         code = 429 if record.http_status == 429 else _HTTP_FOR_STATUS.get(record.status, 500)
         raise HTTPException(code, {"status": record.status, "request_id": record.request_id}) from None
     return {"text": text, "request_id": record.request_id}
 
 
-def _answer(record: db.RequestRecord, prompt: pipeline.Prompt, stages: list[str]) -> str:
+def _answer(record: db.RequestRecord, prompt: pipeline.Prompt, stages: list[str],
+            use_cache: bool = True) -> str:
     """Compress the prompt, send it to Gemini and return the reply text.
 
     `stages` are the names of the compression stages to run, in order, e.g.
@@ -119,7 +123,16 @@ def _answer(record: db.RequestRecord, prompt: pipeline.Prompt, stages: list[str]
 
         prompt = compressor_service.compressed_prompt
         logger.info("Prompt sent to %s: %r", MODEL, prompt.render())
+
+        cache_key = cache.make_key(MODEL, prompt.system, prompt.render())
+        if use_cache and (cached := cache.get(cache_key)) is not None:
+            logger.info("Cache hit %s", cache_key[:12])
+            record.status = db.STATUS_OK
+            record.latency_upstream_ms = 0
+            return cached  # the finally block still saves the telemetry row
+
         kwargs = {"model": MODEL, "input": prompt.render()}
+        
         if prompt.system is not None:
             kwargs["system_instruction"] = prompt.system
         upstream_start = time.perf_counter()
@@ -128,7 +141,13 @@ def _answer(record: db.RequestRecord, prompt: pipeline.Prompt, stages: list[str]
         finally:
             record.latency_upstream_ms = _ms_since(upstream_start)
         fill_from_interaction(record, interaction)  # tokens, status, ids (gemini_parse.py)
-        return reply_text(interaction)
+        reply = reply_text(interaction)
+
+        if use_cache and record.status == db.STATUS_OK:  # never cache failures
+            cache.put(cache_key, MODEL, reply)
+
+        return reply
+
     except Exception as exc:
         fill_from_error(record, exc)  # sets status + error fields, then the error still goes out
         raise
