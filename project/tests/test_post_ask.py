@@ -75,7 +75,12 @@ def test_post_ask_returns_text_and_saves_row(monkeypatch, client):
     assert response.status_code == 200
     body = response.json()
     assert body["text"] == "Canberra"
-    assert sent == {"model": "gemini-3.5-flash", "input": "capital?", "system_instruction": "be brief"}
+    assert sent == {
+        "model": "gemini-3.5-flash",
+        "input": "capital?",
+        "system_instruction": "be brief",
+        "generation_config": {"max_output_tokens": main.DEFAULT_MAX_OUTPUT_TOKENS},
+    }
     [row] = db.fetch_requests(request_id=body["request_id"])
     assert row["status"] == db.STATUS_OK
     assert row["compression"] == "none"
@@ -128,6 +133,98 @@ def test_post_ask_runs_the_stages(monkeypatch, client):
     assert sent["input"] == "HELLO!"
     [row] = db.fetch_requests(request_id=response.json()["request_id"])
     assert row["compression"] == "shout+exclaim"
+
+
+def capped_reply(text):
+    """What Gemini sends back when it stops at max_output_tokens."""
+    reply = ok_reply(text)
+    reply.status = "incomplete"
+    return reply
+
+
+def test_post_ask_sends_the_clients_cap(monkeypatch, client):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
+
+    response = client.post("/ask", json={"prompt": "hello", "max_output_tokens": 300})
+
+    assert sent["generation_config"] == {"max_output_tokens": 300}
+    [row] = db.fetch_requests(request_id=response.json()["request_id"])
+    assert row["max_output_tokens"] == 300
+    assert row["truncated"] == 0 and row["cap_retry"] == 0
+
+
+def test_post_ask_null_cap_sends_none(monkeypatch, client):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
+
+    response = client.post("/ask", json={"prompt": "hello", "max_output_tokens": None})
+
+    assert "generation_config" not in sent
+    [row] = db.fetch_requests(request_id=response.json()["request_id"])
+    assert row["max_output_tokens"] is None
+
+
+@pytest.mark.parametrize("cap", [0, -5])
+def test_post_ask_rejects_a_cap_below_one(client, cap):
+    assert client.post("/ask", json={"prompt": "hello", "max_output_tokens": cap}).status_code == 422
+
+
+def test_get_ask_takes_a_cap(monkeypatch, client):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
+
+    client.get("/ask", params={"prompt": "hello", "max_output_tokens": 50})
+
+    assert sent["generation_config"] == {"max_output_tokens": 50}
+
+
+def test_cut_off_text_is_sent_back_marked_truncated(monkeypatch, client):
+    calls = []
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: calls.append(kw) or capped_reply("Rivers are"))
+
+    response = client.post("/ask", json={"prompt": "essay", "max_output_tokens": 40})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["text"] == "Rivers are" and body["truncated"] is True
+    assert len(calls) == 1
+    [row] = db.fetch_requests(request_id=body["request_id"])
+    assert row["status"] == db.STATUS_OK
+    assert row["truncated"] == 1 and row["cap_retry"] == 0
+    assert row["error_type"] is None
+
+
+@pytest.mark.parametrize("cut_off", ["[", '{"answer": "Can', "Here:\n```python\ndef f(", "  ", "<ul><li>"])
+def test_cut_off_structured_reply_is_asked_again_uncapped(monkeypatch, client, cut_off):
+    calls = []
+
+    def fake_create(**kwargs):
+        calls.append(kwargs)
+        return capped_reply(cut_off) if len(calls) == 1 else ok_reply('{"answer": "Canberra"}')
+
+    monkeypatch.setattr(main.client.interactions, "create", fake_create)
+
+    response = client.post("/ask", json={"prompt": "json please", "max_output_tokens": 40})
+
+    body = response.json()
+    assert body["text"] == '{"answer": "Canberra"}' and body["truncated"] is False
+    assert calls[0]["generation_config"] == {"max_output_tokens": 40}
+    assert "generation_config" not in calls[1]
+    [row] = db.fetch_requests(request_id=body["request_id"])
+    assert row["status"] == db.STATUS_OK
+    assert row["cap_retry"] == 1 and row["truncated"] == 0
+    assert row["output_tokens"] == 6 and row["total_tokens"] == 70  # both calls added up
+
+
+def test_incomplete_without_a_cap_is_still_not_completed(monkeypatch, client):
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: capped_reply("Rivers are"))
+
+    response = client.post("/ask", json={"prompt": "essay", "max_output_tokens": None})
+
+    [row] = db.fetch_requests(request_id=response.json()["request_id"])
+    assert row["status"] == db.STATUS_NOT_COMPLETED
+    assert row["truncated"] == 0
 
 
 def test_unknown_stage_raises():

@@ -53,7 +53,7 @@ def client():
 
 
 def test_success_sets_total_and_upstream(monkeypatch, records, client):
-    def fake_create(model, input):
+    def fake_create(model, input, generation_config=None):
         time.sleep(0.01)
         return SimpleNamespace(output_text="hi")
 
@@ -69,7 +69,7 @@ def test_success_sets_total_and_upstream(monkeypatch, records, client):
 
 
 def test_gemini_error_still_sets_latency(monkeypatch, records, client):
-    def fake_create(model, input):
+    def fake_create(model, input, generation_config=None):
         time.sleep(0.01)
         raise RuntimeError("gemini is down")
 
