@@ -47,6 +47,15 @@ def reply_text(interaction):
     return text if isinstance(text, str) else ""  # a dict reply has no output_text if there's no text
 
 
+def hit_output_cap(interaction):
+    """Whether Gemini stopped because it reached max_output_tokens.
+
+    It says so with status "incomplete" and no errors, and output_text holds
+    whatever it got to before stopping (e.g. '[' for a JSON list).
+    """
+    return _get(interaction, "status") == "incomplete" and not _get(interaction, "errors")
+
+
 def fill_from_interaction(record, interaction):
     """Fill the record from a reply that came back from interactions.create."""
     usage = _get(interaction, "usage")

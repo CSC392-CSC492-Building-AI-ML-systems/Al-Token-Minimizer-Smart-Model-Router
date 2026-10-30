@@ -118,6 +118,7 @@ def run_args(tmp_path, **overrides):
         tests=["control_short", "verbose_json"],
         repeats=2,
         pipelines=["none"],
+        caps=["default"],
         seed=0,
         delay=0,
         retries=1,
@@ -131,7 +132,7 @@ def run_args(tmp_path, **overrides):
 
 
 def test_run_grades_and_reports(monkeypatch, tmp_path):
-    def fake_create(model, input, system_instruction=None):
+    def fake_create(model, input, system_instruction=None, generation_config=None):
         if system_instruction:  # verbose_json
             return ok_reply('{"answer": "Canberra", "confidence": 0.9}')
         return ok_reply("72°F is 22.2°C")
@@ -151,10 +152,37 @@ def test_run_grades_and_reports(monkeypatch, tmp_path):
     assert "| control_short | none |" in (out / "report.md").read_text(encoding="utf-8")
 
 
+def test_run_compares_caps_against_no_cap(monkeypatch, tmp_path):
+    caps_sent = []
+
+    def fake_create(model, input, system_instruction=None, generation_config=None):
+        caps_sent.append((generation_config or {}).get("max_output_tokens"))
+        return ok_reply("72°F is 22.2°C")
+
+    monkeypatch.setattr(main.client.interactions, "create", fake_create)
+
+    out = run.run(run_args(tmp_path, tests=["control_short"], repeats=1, caps=[100, "none"]))
+
+    assert sorted(caps_sent, key=str) == [100, None]
+    meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    assert meta["pipelines"] == ["none cap=100", "none cap=none"]
+    assert meta["baseline"] == "none cap=none"
+    report_json = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert "control_short/none cap=100" in report_json["change_vs_baseline"]
+    assert "## Change vs `none cap=none`" in (out / "report.md").read_text(encoding="utf-8")
+
+
+def test_cap_argument():
+    assert run._cap("none") == "none" and run._cap("default") == "default" and run._cap("256") == 256
+    for bad in ("0", "-3", "lots"):
+        with pytest.raises(Exception):
+            run._cap(bad)
+
+
 def test_run_retries_rate_limits(monkeypatch, tmp_path):
     calls = []
 
-    def fake_create(model, input, system_instruction=None):
+    def fake_create(model, input, system_instruction=None, generation_config=None):
         calls.append(input)
         if len(calls) == 1:
             raise RateLimited("slow down")
@@ -171,7 +199,7 @@ def test_run_retries_rate_limits(monkeypatch, tmp_path):
 
 
 def test_jev_only_asked_about_failed_judgeable_checks(monkeypatch, tmp_path):
-    def fake_create(model, input, system_instruction=None):
+    def fake_create(model, input, system_instruction=None, generation_config=None):
         if system_instruction:
             return ok_reply("Canberra")  # fails verbose_json, which Jev must not overrule
         return ok_reply("twenty-two point two degrees")  # fails the number check
@@ -198,7 +226,7 @@ def test_jev_only_asked_about_failed_judgeable_checks(monkeypatch, tmp_path):
 
 
 def test_run_stops_when_the_quota_is_used_up(monkeypatch, tmp_path):
-    def fake_create(model, input, system_instruction=None):
+    def fake_create(model, input, system_instruction=None, generation_config=None):
         raise RateLimited("quota")
 
     monkeypatch.setattr(main.client.interactions, "create", fake_create)

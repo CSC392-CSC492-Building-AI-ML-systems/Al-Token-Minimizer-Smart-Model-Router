@@ -55,6 +55,10 @@ COLUMNS = {
     "thought_tokens": "INTEGER", # from gemini
     "cached_tokens": "INTEGER", # from gemini
     "total_tokens": "INTEGER", # from gemini
+    # output cap
+    "max_output_tokens": "INTEGER",  # cap sent to Gemini (thinking counts toward it), NULL for no cap
+    "truncated": "INTEGER",  # 1 if the reply sent back was cut off at the cap
+    "cap_retry": "INTEGER",  # 1 if a structured reply hit the cap and was asked again uncapped (tokens are both calls)
     # latency, in milliseconds
     "latency_total_ms": "REAL",
     "latency_upstream_ms": "REAL",
@@ -117,6 +121,10 @@ class RequestRecord:
     thought_tokens: int | None = None
     cached_tokens: int | None = None
     total_tokens: int | None = None
+    # output cap
+    max_output_tokens: int | None = None
+    truncated: int | None = None
+    cap_retry: int | None = None
     # latency, in milliseconds
     latency_total_ms: float | None = None
     latency_upstream_ms: float | None = None
