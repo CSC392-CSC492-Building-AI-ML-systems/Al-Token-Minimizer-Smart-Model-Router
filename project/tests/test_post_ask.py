@@ -78,7 +78,7 @@ def test_post_ask_returns_text_and_saves_row(monkeypatch, client):
     assert sent == {
         "model": "gemini-3.5-flash",
         "input": "capital?",
-        "system_instruction": "be brief\n\n" + main.length_hint(main.DEFAULT_SOFT_OUTPUT_LIMIT),
+        "system_instruction": "be brief",
     }
     [row] = db.fetch_requests(request_id=body["request_id"])
     assert row["status"] == db.STATUS_OK
@@ -94,7 +94,7 @@ def test_post_ask_without_system_doesnt_send_one(monkeypatch, client):
     sent = {}
     monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
 
-    client.post("/ask", json={"prompt": "hello", "soft_output_limit": None})
+    client.post("/ask", json={"prompt": "hello"})
 
     assert "system_instruction" not in sent
 
@@ -141,16 +141,31 @@ def long_reply(output_tokens):
     return reply
 
 
-def test_default_soft_limit_is_asked_for_in_the_system_prompt(monkeypatch, client):
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_soft_limit_is_off_by_default(monkeypatch, client, method):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply("x" * 99))
+
+    if method == "get":
+        client.get("/ask", params={"prompt": "hello"})
+    else:
+        assert client.post("/ask", json={"prompt": "hello"}).json()["over_limit"] is False
+
+    assert "system_instruction" not in sent  # "none" compression sends the prompt untouched
+    assert "generation_config" not in sent  # and there's never a hard cap
+    [row] = db.fetch_requests()
+    assert row["soft_output_limit"] is None and row["over_limit"] is None
+
+
+def test_soft_limit_is_sent_when_the_client_asks(monkeypatch, client):
     sent = {}
     monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
 
-    response = client.post("/ask", json={"prompt": "hello"})
+    response = client.post("/ask", json={"prompt": "hello", "soft_output_limit": 400})
 
-    assert sent["system_instruction"] == main.length_hint(main.DEFAULT_SOFT_OUTPUT_LIMIT)
-    assert "generation_config" not in sent  # no hard cap, so nothing gets cut off
+    assert sent["system_instruction"] == main.length_hint(400)
     [row] = db.fetch_requests(request_id=response.json()["request_id"])
-    assert row["soft_output_limit"] == main.DEFAULT_SOFT_OUTPUT_LIMIT
+    assert row["soft_output_limit"] == 400
 
 
 def test_soft_limit_goes_after_the_clients_system_prompt(monkeypatch, client):
@@ -244,9 +259,8 @@ def test_explicit_empty_stages_override_configured_default(monkeypatch, client):
     sent = []
     monkeypatch.setattr(main, "DEFAULT_COMPRESSION", "light")
     monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.append(kw) or ok_reply())
-    # no soft limit, so the system prompt is only what the stages made
-    client.post("/ask", json={"prompt": "hi", "soft_output_limit": None})
-    client.post("/ask", json={"prompt": "hi", "stages": [], "soft_output_limit": None})
+    client.post("/ask", json={"prompt": "hi"})
+    client.post("/ask", json={"prompt": "hi", "stages": []})
     assert sent[0]["system_instruction"] == pipeline.CONCISE_INSTRUCTION
     assert "system_instruction" not in sent[1]
     assert [row["compression"] for row in db.fetch_requests()] == ["concise", "none"]

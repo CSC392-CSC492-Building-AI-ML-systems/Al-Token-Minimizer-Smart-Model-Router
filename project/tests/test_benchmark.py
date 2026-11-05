@@ -20,8 +20,8 @@ import main  # noqa: E402
 from benchmark import cases, run  # noqa: E402
 from tests.test_post_ask import RateLimited, ok_reply  # noqa: E402
 
-# every call gets a system prompt now (the soft limit's hint), so the fakes spot
-# verbose_json by its own one
+# a call can also get a system prompt from the soft limit's hint, so the fakes
+# spot verbose_json by its own one
 VERBOSE_JSON_SYSTEM = cases.TESTS["verbose_json"].system
 
 

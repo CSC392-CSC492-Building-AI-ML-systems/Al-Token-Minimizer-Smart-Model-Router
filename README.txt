@@ -58,8 +58,7 @@ and bypasses the response cache. Prefer POST to keep prompts out of URLs.
 
 COMPRESSION LEVELS (CSC-14, CSC-16, CSC-17)
 
-    none   Unchanged user and system prompts (apart from the soft output
-           limit's length line, see below). Default and benchmark baseline.
+    none   Unchanged user and system prompts. Default and benchmark baseline.
     light  Add a concise-answer system instruction.
     code   Compact fenced Python and JavaScript structural whitespace.
     full   Run code compression, then concise-answer guidance.
@@ -99,12 +98,13 @@ the original user text while retaining any selected concise-answer guidance.
 
 SOFT OUTPUT LIMIT (CSC-19)
 
-There is no hard cap on replies, so nothing is ever cut off. Instead, after the
-compression stages run, one line is added to the end of the system prompt
-asking Gemini to aim for under 1024 output tokens by default
-(DEFAULT_SOFT_OUTPUT_LIMIT in main.py) and to always finish its answer anyway.
-Send "soft_output_limit": 500 to ask for a different length, or
-"soft_output_limit": null for no limit (GET /ask takes it as a query parameter).
+An optional add-on, off by default, so the compression levels above (none
+included) behave exactly as described unless a request asks for it. There is
+no hard cap on replies, so nothing is ever cut off. Send "soft_output_limit": 500
+(GET /ask takes it as a query parameter) and, after the compression stages run,
+one line is added to the end of the system prompt asking Gemini to aim for
+under 500 output tokens and to always finish its answer anyway. It works with
+any compression level, e.g. on top of concise guidance with "light" or "full".
 The limit is on the answer only; thinking tokens aren't counted.
 
 A reply that goes over is still sent back whole, with "over_limit": true. Every

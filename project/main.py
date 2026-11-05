@@ -30,10 +30,12 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 MODEL = "gemini-3.5-flash"
 model_package = ModelPackage(pricing=None, tokenizer=GeminiTokenCounter(client))
-# soft_output_limit when the client doesn't send one: the reply length (in
-# output tokens, thinking not included) the prompt asks Gemini to aim for.
-# Nothing is cut off, a reply that goes over is only flagged (see _call_gemini).
-DEFAULT_SOFT_OUTPUT_LIMIT = 1024
+# soft_output_limit when the client doesn't send one. The limit is an opt-in
+# add-on: off by default, so compression "none" stays an unchanged prompt. When
+# a client sends one, the prompt asks Gemini to aim for that many output tokens
+# (thinking not included). Nothing is cut off, a reply that goes over is only
+# flagged (see _call_gemini).
+DEFAULT_SOFT_OUTPUT_LIMIT = None
 DEFAULT_COMPRESSION = pipeline.validate_pipeline(os.environ.get("COMPRESSION_LEVEL", pipeline.DEFAULT_PIPELINE))
 
 
@@ -65,7 +67,7 @@ def _ms_since(start):
 #   .........
 #   db.insert_request(record) <-- this actually saves to the sqlite
 @app.get("/ask")
-def ask(prompt: str, soft_output_limit: Annotated[int, Query(gt=0)] = DEFAULT_SOFT_OUTPUT_LIMIT):
+def ask(prompt: str, soft_output_limit: Annotated[int | None, Query(gt=0)] = DEFAULT_SOFT_OUTPUT_LIMIT):
     record = db.RequestRecord(endpoint="/ask", model=MODEL)
     try:
         text = _answer(
@@ -84,7 +86,8 @@ class AskRequest(BaseModel):
     compression: str | None = None
     stages: list[str] | None = None
     cache: Literal["off", "use", "refresh"] = "off"
-    # reply length in output tokens the model is asked to stay under. null for no limit
+    # reply length in output tokens the model is asked to stay under. Leave it out
+    # (or null) for no limit
     soft_output_limit: int | None = Field(DEFAULT_SOFT_OUTPUT_LIMIT, gt=0)
 
     @field_validator("compression")
