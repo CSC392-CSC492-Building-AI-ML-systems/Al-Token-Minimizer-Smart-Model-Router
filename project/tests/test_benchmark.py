@@ -8,6 +8,7 @@ Run from the project folder:
 
 import json
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -108,10 +109,17 @@ def test_bullet_check():
     assert check("Try these:\n- one\n- two\n* three")[0]
     assert check("Just go to bed earlier.")[0]
     assert not check("1. one\n2. two\n3. three\n4. four")[0]
+    assert not check("")[0]
 
 
 def test_numbers_in():
     assert cases.numbers_in("Total: $1,234.50 (was -3)") == [1234.5, -3.0]
+
+
+def test_number_check_does_not_accept_a_correct_intermediate_value():
+    check = cases.TESTS["control_short"].check
+    assert check("72°F is 22.2°C")[0]
+    assert not check("22.2 is incorrect; my final answer is 99 degrees.")[0]
 
 
 # ---------------------------------------------------------------- runner
@@ -244,3 +252,182 @@ def test_run_stops_when_the_quota_is_used_up(monkeypatch, tmp_path):
 
     assert len((out / "results.jsonl").read_text(encoding="utf-8").splitlines()) == 3
     assert "Stopped early" in (out / "report.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("reply", [
+    '{"answer": "Sydney", "confidence": 0.9}',
+    '{"answer": "Canberra", "confidence": true}',
+    '{"answer": "Canberra", "confidence": 1.1}',
+    '{"answer": "Canberra", "confidence": 0.9, "extra": 1}',
+])
+def test_json_check_rejects_wrong_content_and_schema(reply):
+    assert not cases.TESTS["verbose_json"].check(reply)[0]
+
+
+def test_workload_covers_exact_repeats_and_near_matches():
+    original, repeated, changed_prompt, changed_system = cases.cache_cases()
+    assert (original.prompt, original.system) == (repeated.prompt, repeated.system)
+    assert original.prompt != changed_prompt.prompt and original.system == changed_prompt.system
+    assert original.prompt == changed_system.prompt and original.system != changed_system.system
+    for case in cases.cache_cases() + cases.code_controls() + cases.concise_cases()[:1]:
+        assert case.check(case.expected)[0]
+        assert not case.check('"incorrect"')[0]
+
+
+def _rows(out, name="results.jsonl"):
+    return [json.loads(line) for line in (out / name).read_text(encoding="utf-8").splitlines()]
+
+
+def test_cache_evaluation_keeps_phases_separate_and_accounts_for_saved_calls(monkeypatch, tmp_path):
+    calls = []
+
+    def create(model, input, system_instruction=None):
+        calls.append((input, system_instruction))
+        answer = 43 if "26" in input else 42
+        if "object" in system_instruction:
+            answer = {"answer": answer}
+        return ok_reply(json.dumps(answer))
+
+    monkeypatch.setattr(main.client.interactions, "create", create)
+    out = run.run(run_args(tmp_path, tests=[c.name for c in cases.cache_cases()],
+                           cache_modes=["off", "cold", "warm"]))
+    rows = _rows(out)
+    assert len(rows) == 24
+    assert len(calls) == 19  # 8 off + 8 refresh + 3 unique warm requests
+    assert {r["cache_status"] for r in rows if r["cache_mode"] == "off"} == {"off"}
+    assert {r["cache_status"] for r in rows if r["cache_mode"] == "cold"} == {"refresh"}
+    hits = [r for r in rows if r["cache_status"] == "hit"]
+    assert len(hits) == 5
+    assert all(r["cache_expected_hit"] and r["cache_reply_matches"] for r in hits)
+    assert all(r["total_tokens"] == 0 and r["input_tokens_raw"] > 0 for r in hits)
+    assert all(row["passed"] for row in _rows(out, "graded.jsonl"))
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    warm = report["stats"]["ALL/none/warm"]
+    assert warm["cache_hit_rate"] == 5 / 8
+    assert warm["total_tokens_sum"] == 105
+    assert warm["unknown_usage_attempts"] == 0
+    assert warm["unexpected_cache_hits"] == warm["cache_reply_mismatches"] == 0
+    assert report["stats"]["ALL/none/off"]["total_tokens_sum"] == 280
+    assert report["change_vs_cache_off"]["none/warm"]["total_tokens"] == -5 / 8
+
+
+def test_benchmark_restores_existing_database_and_cache_even_on_failure(monkeypatch, tmp_path):
+    from response_cache import CachedResponse, ResponseCache
+
+    previous_cache = ResponseCache(max_entries=3, ttl_seconds=17, max_entry_bytes=256)
+    previous_cache.put("existing", CachedResponse("keep this", 1, 1))
+    monkeypatch.setattr(main, "response_cache", previous_cache)
+    previous_db = os.environ["TELEMETRY_DB_PATH"]
+
+    def fail(*args, **kwargs):
+        assert main.response_cache is not previous_cache
+        assert main.response_cache.max_entry_bytes == 256
+        raise RuntimeError("interrupted")
+
+    monkeypatch.setattr(run, "_call", fail)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        run.run(run_args(tmp_path))
+    assert main.response_cache is previous_cache
+    assert main.response_cache.get("existing").text == "keep this"
+    assert os.environ["TELEMETRY_DB_PATH"] == previous_db
+
+
+def test_benchmark_default_does_not_persist_answers_or_check_diagnostics(monkeypatch, tmp_path):
+    secret = "PRIVATE_RESPONSE_SENTINEL_7829"
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kwargs: ok_reply(secret))
+    case = replace(cases.TESTS["control_short"], check=lambda reply: (False, reply), judge=False)
+    monkeypatch.setitem(cases.TESTS, "control_short", case)
+    out = run.run(run_args(tmp_path, tests=["control_short"], repeats=1))
+    assert all("reply" not in row for row in _rows(out))
+    for path in out.iterdir():
+        if path.is_file():
+            assert secret.encode() not in path.read_bytes()
+    with pytest.raises(SystemExit, match="Replies were not retained"):
+        run.grade(out, use_judge=False)
+    run.report(out)  # report rebuild remains available
+
+
+def test_explicit_saved_replies_can_be_regraded(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kwargs: ok_reply("22.22"))
+    monkeypatch.setenv("OPEN_ROUTER_KEY", "fake")
+    out = run.run(run_args(tmp_path, tests=["control_short"], repeats=1, save_replies=True, no_judge=False))
+    assert _rows(out)[0]["reply"] == "22.22"
+    original_meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    assert original_meta["judge_enabled"] and original_meta["judge_threshold"] == 0.8
+    run.grade(out, use_judge=False, threshold=0.95)
+    assert _rows(out, "graded.jsonl")[0]["passed"]
+    run.report(out)
+    meta = json.loads((out / "report.json").read_text(encoding="utf-8"))["meta"]
+    assert meta["judge_enabled"] is False
+    assert meta["judge_threshold"] == 0.95
+    assert meta["graded_at"] >= original_meta["started_at"]
+
+
+@pytest.mark.parametrize("threshold", [-0.1, 1.1, float("nan")])
+def test_invalid_regrade_threshold_is_rejected_before_reading_or_rewriting(tmp_path, threshold):
+    with pytest.raises(SystemExit, match="threshold must be between"):
+        run.grade(tmp_path / "nonexistent", threshold=threshold)
+
+
+@pytest.mark.parametrize("option", ["--stages", "--pipelines"])
+def test_cli_accepts_stage_combinations_and_preset_aliases(monkeypatch, option):
+    calls = []
+    monkeypatch.setattr(run, "run", lambda args: calls.append(args))
+    run.cli(["run", option, "none", "code+concise", "full", "--no-judge"])
+    assert calls[0].pipelines == ["none", "code+concise", "full"]
+
+
+def test_run_sends_ordered_stage_combinations_and_preserves_report_label(monkeypatch, tmp_path):
+    sent = []
+    monkeypatch.setitem(run.compression.STAGES, "mark_a", lambda prompt: replace(prompt, text=prompt.text + " a"))
+    monkeypatch.setitem(run.compression.STAGES, "mark_b", lambda prompt: replace(prompt, text=prompt.text + " b"))
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kwargs: sent.append(kwargs) or ok_reply("22.22"))
+    out = run.run(run_args(tmp_path, tests=["control_short"], repeats=1, pipelines=["mark_a+mark_b"]))
+    assert sent[0]["input"].endswith(" a b")
+    [row] = _rows(out)
+    assert row["pipeline"] == "mark_a+mark_b"
+    [stored] = db.fetch_requests(out / "telemetry.db")
+    assert stored["compression"] == "mark_a+mark_b"
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert report["stats"]["ALL/mark_a+mark_b"]["pass_rate"] == 1
+
+
+def test_equivalent_preset_and_stage_label_share_expected_cache_identity(monkeypatch, tmp_path):
+    sent = []
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kwargs: sent.append(kwargs) or ok_reply("22.22"))
+    out = run.run(run_args(tmp_path, tests=["control_short"], repeats=1,
+                           pipelines=["full", "code+concise"], cache_modes=["warm"]))
+    assert len(sent) == 1
+    rows = _rows(out)
+    [hit] = [row for row in rows if row["cache_status"] == "hit"]
+    assert hit["cache_expected_hit"] and hit["cache_reply_matches"]
+    meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    assert meta["pipeline_fingerprints"]["full"] == meta["pipeline_fingerprints"]["code+concise"]
+
+
+def test_usage_totals_include_retries_and_mark_missing_usage_unknown(monkeypatch, tmp_path):
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RateLimited("slow down")
+        return ok_reply("22.22")
+
+    monkeypatch.setattr(main.client.interactions, "create", create)
+    out = run.run(run_args(tmp_path, tests=["control_short"], repeats=1))
+    stats = json.loads((out / "report.json").read_text(encoding="utf-8"))["stats"]["ALL/none"]
+    assert stats["attempts"] == 2
+    assert stats["total_tokens_sum"] == 35
+    assert stats["unknown_usage_attempts"] == 1
+
+
+@pytest.mark.parametrize("overrides", [
+    {"repeats": 0}, {"retries": -1}, {"delay": -1}, {"backoff": -1},
+    {"max_rate_limited": 0}, {"threshold": 2}, {"cache_modes": ["warm", "warm"]},
+    {"pipelines": ["no_such_stage"]},
+])
+def test_invalid_run_settings_fail_before_making_requests(tmp_path, overrides):
+    with pytest.raises(SystemExit):
+        run.run(run_args(tmp_path, **overrides))
+    assert not (tmp_path / "results").exists()

@@ -2,7 +2,7 @@
 
 From the project folder:
     uv run python -m benchmark run                      # baseline: every test 3 times, no stages ("none")
-    uv run python -m benchmark run --stages none a a+b --repeats 5   # compare no stages, stage a, and a then b
+    uv run python -m benchmark run --stages none code code+concise --repeats 5
     uv run python -m benchmark run --tests orders_json verbose_json --repeats 1
     uv run python -m benchmark run --limits none 512 1024    # compare soft output limits against no limit
     uv run python -m benchmark grade benchmark/results/<run>   # re-grade (e.g. after changing a check)
@@ -12,19 +12,20 @@ From the project folder:
 Each run gets its own folder, named after the time it started, under
 benchmark/results/ (gitignored), e.g. benchmark/results/2026-10-15_03-14-44/:
     telemetry.db    the /ask rows for this run only, same schema as the real one
-    results.jsonl   one line per call: test, pipeline, repeat, reply text and the row's metrics
+    results.jsonl   one line per call: test, pipeline, repeat and the row's metrics
     graded.jsonl    results.jsonl plus the check result and Jev's verdict
     report.md/json  pass rate, tokens and latency per test and pipeline
     meta.json       the settings the run used
 
 Requests go through POST /ask in this process (FastAPI's TestClient), so they
 take the same path as real traffic, compression and telemetry included,
-without needing the server running. A "pipeline" here is a combination of
-compression stages written as a label: "none", "a" or "a+b" (stage a, then b).
-With --limits it's also a soft output limit, e.g. "none limit=1024"
-(soft_output_limit 1024) or "none limit=none" (no limit); without it every call
-gets the server's default limit and pipelines are named by their stages alone.
-Each repeat runs every (test, pipeline)
+without needing the server running. A "pipeline" here is an ordered combination
+of stages, written as a label such as "none", "code" or "code+concise", or a
+preset such as "light" or "full". Replies are graded in memory and are only
+saved when --save-replies is explicitly set. With --limits a pipeline also has
+a soft output limit, e.g. "none limit=1024" (soft_output_limit 1024) or
+"none limit=none" (no limit); without it every call gets the server's default
+limit and pipelines are named by their stages alone. Each repeat runs every (test, pipeline)
 pair in a shuffled order, so pipelines are compared under the same Gemini load
 instead of one after the other.
 """
@@ -37,6 +38,7 @@ import statistics
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,7 +49,8 @@ from benchmark.judge import judge
 from compressor import pipeline as compression
 
 RESULTS_DIR = Path(__file__).parent / "results"
-BASELINE = "none"  # no stages; every other combination is compared against it
+BASELINE = "none"  # the baseline must not change if the server default changes
+CACHE_MODES = {"off": "off", "cold": "refresh", "warm": "use"}
 DEFAULT_LIMIT = "default"  # --limits value that leaves soft_output_limit to the server
 NO_LIMIT = "none"  # --limits value that sends soft_output_limit: null
 
@@ -57,17 +60,21 @@ ROW_COLUMNS = (
     "http_status",
     "error_type",
     "error_message",
+    "input_tokens_raw",
+    "input_tokens_compressed",
     "input_tokens_reported",
     "output_tokens",
     "thought_tokens",
     "cached_tokens",
     "total_tokens",
-    "soft_output_limit",
-    "over_limit",
-    "over_limit_by",
     "latency_total_ms",
     "latency_upstream_ms",
     "latency_compress_ms",
+    "latency_count_ms",
+    "cache_status",
+    "soft_output_limit",
+    "over_limit",
+    "over_limit_by",
 )
 RETRY_HTTP = {429, 500, 503}  # rate limited or overloaded ("high demand"): wait and try again
 RETRY_STATUSES = {"timeout", "connection_error"}
@@ -77,62 +84,144 @@ RETRY_STATUSES = {"timeout", "connection_error"}
 
 
 def run(args):
-    unknown = {s for name in args.pipelines for s in compression.unknown_stages(compression.parse_label(name))}
-    if unknown:
-        sys.exit(f"unknown stages {sorted(unknown)}, expected some of {sorted(compression.STAGES)}")
+    try:
+        for name in args.pipelines:
+            compression.resolve_stages(name)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
-    out = RESULTS_DIR / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # local time
+    modes = getattr(args, "cache_modes", ["off"])
+    if not modes or set(modes) - set(CACHE_MODES) or len(modes) != len(set(modes)):
+        sys.exit(f"cache modes must be distinct choices from {list(CACHE_MODES)}")
+    if args.repeats < 1 or args.retries < 0 or args.delay < 0 or args.backoff < 0 or args.max_rate_limited < 1:
+        sys.exit("repeats and max-rate-limited must be positive; retries, delay and backoff must be nonnegative")
+    if not args.pipelines or not args.tests or len(args.pipelines) != len(set(args.pipelines)) or len(args.tests) != len(set(args.tests)):
+        sys.exit("pipeline and test names must be nonempty and unique")
+    if not 0 <= args.threshold <= 1:
+        sys.exit("threshold must be between 0 and 1")
+    limits = getattr(args, "limits", [DEFAULT_LIMIT])
+    if not limits or len(limits) != len(set(limits)):
+        sys.exit("limits must be nonempty and unique")
+    # one pipeline per (stages, limit) pair, so the rest of the runner only sees names
+    baseline_limit = NO_LIMIT if NO_LIMIT in limits else limits[0]
+    args.baseline = _variant_name(BASELINE, baseline_limit, limits)
+    args.pipelines = [_variant_name(name, limit, limits) for name in args.pipelines for limit in limits]
+
+    out = RESULTS_DIR / datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S_%fZ")
     out.mkdir(parents=True, exist_ok=False)
-    # main.py creates its db when imported, so point it at this run's folder first
-    os.environ["TELEMETRY_DB_PATH"] = str(out / "telemetry.db")
-    import db
-    import main
-    from fastapi.testclient import TestClient
+    with _isolated_runtime(out) as (db, main, client):
+        _run_calls(out, args, modes, db, main, client)
+    report(out)
+    return out
 
-    db.init_db()  # in case main was already imported (e.g. in tests) with another db
-    client = TestClient(main.app, raise_server_exceptions=False)
+
+@contextmanager
+def _isolated_runtime(out):
+    """Keep benchmark telemetry and cache contents separate from other in-process work."""
+    previous_db = os.environ.get("TELEMETRY_DB_PATH")
+    os.environ["TELEMETRY_DB_PATH"] = str(out / "telemetry.db")
+    previous_cache = None
+    try:
+        import db
+        import main
+        from fastapi.testclient import TestClient
+        from response_cache import ResponseCache
+
+        previous_cache = main.response_cache
+        main.response_cache = ResponseCache(
+            max_entries=previous_cache.max_entries,
+            ttl_seconds=previous_cache.ttl_seconds,
+            max_entry_bytes=previous_cache.max_entry_bytes,
+            enabled=previous_cache.enabled,
+        )
+        db.init_db()
+        with TestClient(main.app, raise_server_exceptions=False) as client:
+            yield db, main, client
+    finally:
+        if previous_cache is not None:
+            main.response_cache.clear()
+            main.response_cache = previous_cache
+        if previous_db is None:
+            os.environ.pop("TELEMETRY_DB_PATH", None)
+        else:
+            os.environ["TELEMETRY_DB_PATH"] = previous_db
+
+
+def _run_calls(out, args, modes, db, main, client):
     case_list = [case_lib.TESTS[name] for name in args.tests]
-    variants = [(stages, limit) for stages in args.pipelines for limit in args.limits]
-    names = {variant: _variant_name(*variant, args.limits) for variant in variants}
-    baseline_limit = NO_LIMIT if NO_LIMIT in args.limits else args.limits[0]
+    save_replies = getattr(args, "save_replies", False)
+    api_key = _judge_key(not args.no_judge)
     meta = {
         "started_at": _now(),
         "model": main.MODEL,
-        "pipelines": list(names.values()),
-        "baseline": _variant_name(BASELINE, baseline_limit, args.limits),
-        "stages": args.pipelines,
-        "limits": args.limits,
+        "pipelines": args.pipelines,
+        "pipeline_version": compression.PIPELINE_VERSION,
+        "pipeline_fingerprints": {name: compression.fingerprint(_split(name)[0]) for name in args.pipelines},
+        "baseline": args.baseline,
+        "limits": getattr(args, "limits", [DEFAULT_LIMIT]),
         "default_soft_output_limit": main.DEFAULT_SOFT_OUTPUT_LIMIT,
         "tests": args.tests,
         "repeats": args.repeats,
         "seed": args.seed,
         "git_commit": _git_commit(),
+        "cache_modes": modes,
+        "cache_enabled": main.response_cache.enabled,
+        "cache_max_entries": main.response_cache.max_entries,
+        "cache_ttl_seconds": main.response_cache.ttl_seconds,
+        "save_replies": save_replies,
+        "judge_enabled": bool(api_key),
+        "judge_threshold": args.threshold,
     }
     _write_json(out / "meta.json", meta)
 
     order = random.Random(args.seed)
     jobs = []
-    for repeat in range(args.repeats):
-        batch = [(repeat, case, variant) for case in case_list for variant in variants]
-        order.shuffle(batch)
-        jobs += batch
+    for mode in modes:
+        for repeat in range(args.repeats):
+            batch = [(mode, repeat, case, name) for case in case_list for name in args.pipelines]
+            order.shuffle(batch)
+            jobs += batch
     rate_limited = 0  # rate-limited calls in a row, after retries
-    print(f"{len(jobs)} calls to {main.MODEL}, writing to {out}")
-    with open(out / "results.jsonl", "w", encoding="utf-8") as results:
-        for done, (repeat, case, variant) in enumerate(jobs, start=1):
-            name = names[variant]
-            row = _call(client, db, case, *variant, args)
+    print(f"{len(jobs)} proxy requests to {main.MODEL} before retries, writing to {out}")
+    previous_mode = None
+    seen = {}
+    with open(out / "results.jsonl", "w", encoding="utf-8") as results, \
+            open(out / "graded.jsonl", "w", encoding="utf-8") as graded:
+        for done, (mode, repeat, case, name) in enumerate(jobs, start=1):
+            if mode != previous_mode:
+                main.response_cache.clear()
+                seen.clear()
+                previous_mode = mode
+            # Presets and explicit labels resolving to the same stage order
+            # share server cache identity, even when reported under two labels.
+            # The soft limit is part of it too (see response_cache.make_cache_key).
+            stages, limit = _split(name)
+            identity = (case.prompt, case.system, tuple(compression.resolve_stages(stages)), limit)
+            expected_hit = mode == "warm" and identity in seen and main.response_cache.enabled
+            row = _call(client, db, case, name, args, cache_mode=mode)
             row.update(
                 test=case.name,
                 category=case.category,
                 pipeline=name,
                 repeat=repeat,
+                cache_mode=mode,
+                cache_expected_hit=expected_hit,
+                cache_reply_matches=(row["reply"] == seen.get(identity))
+                if row.get("cache_status") == "hit" else None,
             )
+            if row["status"] == "ok" and row.get("cache_status") in {"miss", "refresh"}:
+                seen[identity] = row["reply"]
+            checked = _grade_row(row, api_key=api_key, threshold=args.threshold, retain_details=save_replies)
+            if not save_replies:
+                row.pop("reply", None)
+                checked.pop("reply", None)
             results.write(json.dumps(row) + "\n")
             results.flush()  # so an interrupted run can still be graded
+            graded.write(json.dumps(checked) + "\n")
+            graded.flush()
             latency = row["latency_total_ms"]
             print(
-                f"[{done}/{len(jobs)}] {case.name:<26} {name:<10} {row['status']:<16}"
+                f"[{done}/{len(jobs)}] {case.name:<26} {name:<10} {mode:<5} {row['status']:<16}"
                 f"{'' if latency is None else f'{latency:8.0f} ms'}"
             )
 
@@ -148,9 +237,6 @@ def run(args):
 
     meta["finished_at"] = _now()
     _write_json(out / "meta.json", meta)
-    grade(out, use_judge=not args.no_judge, threshold=args.threshold)
-    report(out)
-    return out
 
 
 def _variant_name(stages, limit, limits):
@@ -158,11 +244,24 @@ def _variant_name(stages, limit, limits):
     return stages if limits == [DEFAULT_LIMIT] else f"{stages} limit={limit}"
 
 
-def _call(client, db, case, stages, limit, args):
+def _split(name):
+    """The reverse of _variant_name: "code limit=512" -> ("code", 512), "none" -> ("none", "default")."""
+    stages, _, limit = name.partition(" limit=")
+    if not limit:
+        return stages, DEFAULT_LIMIT
+    return stages, limit if limit in (DEFAULT_LIMIT, NO_LIMIT) else int(limit)
+
+
+def _call(client, db, case, pipeline_name, args, cache_mode="off"):
     """POST the case to /ask, retrying rate limits and timeouts. Returns the results.jsonl fields."""
-    body = {"prompt": case.prompt, "system": case.system, "stages": compression.parse_label(stages)}
+    stages, limit = _split(pipeline_name)
+    body = {"prompt": case.prompt, "system": case.system,
+            "stages": list(compression.resolve_stages(stages)),
+            "cache": CACHE_MODES[cache_mode]}
     if limit != DEFAULT_LIMIT:
         body["soft_output_limit"] = None if limit == NO_LIMIT else limit
+    attempts = []
+    started = time.perf_counter()
     for attempt in range(1, args.retries + 2):
         response = client.post("/ask", json=body)
         payload = response.json()
@@ -171,6 +270,7 @@ def _call(client, db, case, stages, limit, args):
         if request_id is None:
             raise RuntimeError(f"/ask answered {response.status_code} without a request_id: {payload}")
         [stored] = db.fetch_requests(request_id=request_id)
+        attempts.append(stored)
 
         retryable = stored["http_status"] in RETRY_HTTP or stored["status"] in RETRY_STATUSES
         if response.status_code == 200 or not retryable or attempt > args.retries:
@@ -182,8 +282,13 @@ def _call(client, db, case, stages, limit, args):
     return {
         "request_id": request_id,
         "attempts": attempt,  # the earlier attempts are still in telemetry.db
+        "request_latency_ms": (time.perf_counter() - started) * 1000,
+        "attempt_input_tokens": _known_sum(r["input_tokens_reported"] for r in attempts),
+        "attempt_output_tokens": _known_sum(r["output_tokens"] for r in attempts),
+        "attempt_total_tokens": _known_sum(r["total_tokens"] for r in attempts),
+        "unknown_usage_attempts": sum(r["total_tokens"] is None for r in attempts),
         "reply": payload.get("text"),
-        **{column: stored[column] for column in ROW_COLUMNS},
+        **{column: stored.get(column) for column in ROW_COLUMNS},
     }
 
 
@@ -191,31 +296,47 @@ def _call(client, db, case, stages, limit, args):
 
 
 def grade(out, use_judge=True, threshold=0.8):
-    """Check every ok reply; ask Jev about failed ones on judge=True cases. Writes graded.jsonl."""
+    """Regrade an explicitly retained run. The default run grades replies in memory."""
+    if not 0 <= threshold <= 1:
+        sys.exit("threshold must be between 0 and 1")
+    out = Path(out)
+    api_key = _judge_key(use_judge)
+    rows = _read_jsonl(out / "results.jsonl")
+    if any("reply" not in row for row in rows):
+        sys.exit("Replies were not retained. Use report to rebuild this run's report; "
+                 "future runs need --save-replies for regrading.")
+    meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    with open(out / "graded.jsonl", "w", encoding="utf-8") as graded:
+        for row in rows:
+            graded.write(json.dumps(_grade_row(row, api_key=api_key, threshold=threshold)) + "\n")
+    meta.update(judge_enabled=bool(api_key), judge_threshold=threshold, graded_at=_now())
+    _write_json(out / "meta.json", meta)
+    print(f"graded {len(rows)} replies")
+
+
+def _judge_key(use_judge):
     load_dotenv()
     api_key = os.environ.get("OPEN_ROUTER_KEY")
     if use_judge and not api_key:
         print("OPEN_ROUTER_KEY not set, grading with the checks only")
-        use_judge = False
+    return api_key if use_judge else None
 
-    rows = _read_jsonl(Path(out) / "results.jsonl")
-    judged = 0
-    with open(Path(out) / "graded.jsonl", "w", encoding="utf-8") as graded:
-        for row in rows:
-            row = dict(row, check=None, check_detail=None, jev=None, passed=None)
-            if row["status"] == "ok":
-                case = case_lib.TESTS[row["test"]]
-                row["check"], row["check_detail"] = case.check(row["reply"] or "")
-                if not row["check"] and case.judge and use_judge:
-                    judged += 1
-                    try:
-                        row["jev"] = judge(case.question, case.expected, row["reply"] or "", api_key)
-                    except Exception as exc:  # grade the rest even if OpenRouter is down
-                        row["jev"] = {"error": f"{type(exc).__name__}: {exc}"[:300]}
-                probability = (row["jev"] or {}).get("probability")
-                row["passed"] = row["check"] or (probability is not None and probability >= threshold)
-            graded.write(json.dumps(row) + "\n")
-    print(f"graded {len(rows)} replies, asked Jev about {judged}")
+
+def _grade_row(row, *, api_key, threshold, retain_details=True):
+    row = dict(row, check=None, check_detail=None, jev=None, passed=None)
+    if row["status"] == "ok":
+        case = case_lib.TESTS[row["test"]]
+        row["check"], row["check_detail"] = case.check(row.get("reply") or "")
+        if not retain_details:
+            row["check_detail"] = "deterministic check passed" if row["check"] else "deterministic check failed"
+        if not row["check"] and case.judge and api_key:
+            try:
+                row["jev"] = judge(case.question, case.expected, row.get("reply") or "", api_key)
+            except Exception as exc:  # exceptions can echo the raw answer; retain only their type
+                row["jev"] = {"error": type(exc).__name__}
+        probability = (row["jev"] or {}).get("probability")
+        row["passed"] = bool(row["check"] or (probability is not None and probability >= threshold))
+    return row
 
 
 # ---------------------------------------------------------------- report
@@ -227,10 +348,12 @@ def report(out):
     rows = _read_jsonl(out / "graded.jsonl")
     meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
 
+    modes = meta.get("cache_modes", ["off"])
     groups = {}
     for row in rows:
-        groups.setdefault((row["test"], row["pipeline"]), []).append(row)
-        groups.setdefault(("ALL", row["pipeline"]), []).append(row)
+        mode = row.get("cache_mode", "off")
+        groups.setdefault((row["test"], row["pipeline"], mode), []).append(row)
+        groups.setdefault(("ALL", row["pipeline"], mode), []).append(row)
     tests = [t for t in meta["tests"] if any(key[0] == t for key in groups)] + ["ALL"]
     pipelines = meta["pipelines"]
     stats = {key: _stats(group) for key, group in groups.items()}
@@ -243,29 +366,68 @@ def report(out):
         f"commit `{(meta.get('git_commit') or '?')[:7]}`, started {meta['started_at']}.",
         "",
         *([f"**Stopped early: {meta['stopped_early']}.**", ""] if meta.get("stopped_early") else []),
-        "Pass rate is over the calls that got a reply (errors are counted separately). "
-        "\"Jev\" is how many failed checks Jev passed. Tokens are means as reported by Gemini. "
-        "\"Over limit\" is how many replies went over their soft output limit, "
-        "\"avg over by\" how many output tokens over, on average, for those. "
-        "Times are in ms, over the calls that got a reply: \"total\" is the whole /ask request "
-        "(what a user waits for), \"upstream\" is the Gemini call alone, \"compress\" is the compression pipeline.",
+        "Pass rate is over successful replies; errors are separate. Tokens are mean newly consumed "
+        "provider usage per successful request, including zero usage on cache hits. Raw/compressed "
+        "counts describe the prompt, so they remain nonzero on hits. Times are in ms. "
+        "Request latency includes retries and backoff; upstream and compression times describe the final attempt.",
         "",
-        "| test | pipeline | calls | errors | pass | Jev | over limit | avg over by | input tok | output tok | thought tok "
-        "| total tok | total avg | fastest | slowest | upstream avg | compress avg |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "Cache off bypasses lookup and storage. Cold refreshes every request. Warm starts empty, then "
+        "reuses exact requests, including deliberate duplicate cases. Warm hit rate includes the first miss. "
+        "Expiry and capacity eviction may reduce reuse; unexpected hits or changed cached replies indicate a failure.",
+        "",
+        "Quality and token reductions require a live run to establish. Deterministic mocked tests validate "
+        "the runner and cache accounting, not a model's response quality.",
+        "",
+        "| test | pipeline | cache | calls | errors | pass | hits | hit rate | raw tok | compressed tok "
+        "| input tok | output tok | total tok | request avg | request p95 | upstream avg | compress avg |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for test in tests:
         for name in pipelines:
-            s = stats.get((test, name))
-            if s is None:
-                continue
-            lines.append(
-                f"| {test} | {name} | {s['calls']} | {s['errors']} | {_pct(s['pass_rate'])} | {s['jev_passed']} "
-                f"| {s['over_limit']} | {_num(s['avg_over_by'])} "
-                f"| {_num(s['input_tokens'])} | {_num(s['output_tokens'])} | {_num(s['thought_tokens'])} "
-                f"| {_num(s['total_tokens'])} | {_num(s['latency_avg'])} | {_num(s['latency_min'])} "
-                f"| {_num(s['latency_max'])} | {_num(s['upstream_avg'])} | {_num(s['compress_avg'], 2)} |"
-            )
+            for mode in modes:
+                s = stats.get((test, name, mode))
+                if s is None:
+                    continue
+                lines.append(
+                    f"| {test} | {name} | {mode} | {s['calls']} | {s['errors']} | {_pct(s['pass_rate'])} "
+                    f"| {s['cache_hits']} | {_pct(s['cache_hit_rate'])} | {_num(s['input_tokens_raw'])} "
+                    f"| {_num(s['input_tokens_compressed'])} | {_num(s['input_tokens'])} | {_num(s['output_tokens'])} "
+                    f"| {_num(s['total_tokens'])} | {_num(s['request_latency_avg'])} | {_num(s['request_latency_p95'])} "
+                    f"| {_num(s['upstream_avg'])} | {_num(s['compress_avg'], 2)} |"
+                )
+
+    lines += [
+        "", "## Usage across all attempts", "",
+        "Totals include retries and errors with reported usage. Missing usage is unknown, not zero. "
+        "A total with unknown attempts is a lower bound. No dollar savings are inferred without model pricing.", "",
+        "| pipeline | cache | attempts | input tok | output tok | total tok | unknown usage | unexpected hits | changed replies |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name in pipelines:
+        for mode in modes:
+            s = stats.get(("ALL", name, mode))
+            if s:
+                lines.append(
+                    f"| {name} | {mode} | {s['attempts']} | {_num(s['input_tokens_sum'])} "
+                    f"| {_num(s['output_tokens_sum'])} | {_num(s['total_tokens_sum'])} "
+                    f"| {s['unknown_usage_attempts']} | {s['unexpected_cache_hits']} | {s['cache_reply_mismatches']} |"
+                )
+
+    lines += [
+        "", "## Soft output limit", "",
+        "Replies that went over the output tokens their prompt asked them to stay under. Nothing is cut off, "
+        "so these are complete replies. Cache hits generate nothing new and aren't counted.", "",
+        "| pipeline | cache | limited replies | over limit | over rate | avg over by | max over by |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for name in pipelines:
+        for mode in modes:
+            s = stats.get(("ALL", name, mode))
+            if s:
+                lines.append(
+                    f"| {name} | {mode} | {s['limited_replies']} | {s['over_limit']} | {_pct(s['over_rate'])} "
+                    f"| {_num(s['avg_over_by'])} | {_num(s['max_over_by'])} |"
+                )
 
     baseline = meta.get("baseline", BASELINE)  # runs from before --limits don't have it
     compared = [p for p in pipelines if p != baseline]
@@ -275,32 +437,45 @@ def report(out):
             "",
             f"## Change vs `{baseline}`",
             "",
-            "| test | pipeline | input tok | output tok | thought tok | total tok | total avg | pass rate |",
-            "|---|---|---:|---:|---:|---:|---:|---:|",
+            "Compared within the same cache phase. Token savings on warm phases include response reuse.",
+            "", "| test | pipeline | cache | input tok | output tok | total tok | request avg | pass rate |",
+            "|---|---|---|---:|---:|---:|---:|---:|",
         ]
         for test in tests:
-            base = stats.get((test, baseline))
-            for name in compared:
-                s = stats.get((test, name))
-                if base is None or s is None:
-                    continue
-                d = {
-                    "input_tokens": _change(s["input_tokens"], base["input_tokens"]),
-                    "output_tokens": _change(s["output_tokens"], base["output_tokens"]),
-                    "thought_tokens": _change(s["thought_tokens"], base["thought_tokens"]),
-                    "total_tokens": _change(s["total_tokens"], base["total_tokens"]),
-                    "latency_avg": _change(s["latency_avg"], base["latency_avg"]),
-                    "pass_rate_points": None
-                    if s["pass_rate"] is None or base["pass_rate"] is None
-                    else (s["pass_rate"] - base["pass_rate"]) * 100,
-                }
-                deltas[f"{test}/{name}"] = d
-                points = d["pass_rate_points"]
-                lines.append(
-                    f"| {test} | {name} | {_signed_pct(d['input_tokens'])} | {_signed_pct(d['output_tokens'])} "
-                    f"| {_signed_pct(d['thought_tokens'])} | {_signed_pct(d['total_tokens'])} "
-                    f"| {_signed_pct(d['latency_avg'])} | {'-' if points is None else f'{points:+.0f} pts'} |"
-                )
+            for mode in modes:
+                base = stats.get((test, baseline, mode))
+                for name in compared:
+                    s = stats.get((test, name, mode))
+                    if base is None or s is None:
+                        continue
+                    d = {
+                        "input_tokens": _change(s["input_tokens"], base["input_tokens"]),
+                        "output_tokens": _change(s["output_tokens"], base["output_tokens"]),
+                        "total_tokens": _change(s["total_tokens"], base["total_tokens"]),
+                        "latency_avg": _change(s["request_latency_avg"], base["request_latency_avg"]),
+                        "pass_rate_points": None
+                        if s["pass_rate"] is None or base["pass_rate"] is None
+                        else (s["pass_rate"] - base["pass_rate"]) * 100,
+                    }
+                    deltas[_stats_key(test, name, mode, modes)] = d
+                    points = d["pass_rate_points"]
+                    lines.append(
+                        f"| {test} | {name} | {mode} | {_signed_pct(d['input_tokens'])} "
+                        f"| {_signed_pct(d['output_tokens'])} | {_signed_pct(d['total_tokens'])} "
+                        f"| {_signed_pct(d['latency_avg'])} | {'-' if points is None else f'{points:+.0f} pts'} |"
+                    )
+
+    cache_deltas = {}
+    if "off" in modes:
+        for name in pipelines:
+            base = stats.get(("ALL", name, "off"))
+            for mode in (m for m in modes if m != "off"):
+                s = stats.get(("ALL", name, mode))
+                if base and s:
+                    cache_deltas[f"{name}/{mode}"] = {
+                        "total_tokens": _change(s["total_tokens"], base["total_tokens"]),
+                        "request_latency": _change(s["request_latency_avg"], base["request_latency_avg"]),
+                    }
 
     failures = [r for r in rows if r["passed"] is False]
     if failures:
@@ -324,7 +499,9 @@ def report(out):
     (out / "report.md").write_text(text, encoding="utf-8")
     _write_json(
         out / "report.json",
-        {"meta": meta, "stats": {f"{f}/{p}": s for (f, p), s in stats.items()}, "change_vs_baseline": deltas},
+        {"meta": meta,
+         "stats": {_stats_key(f, p, m, modes): s for (f, p, m), s in stats.items()},
+         "change_vs_baseline": deltas, "change_vs_cache_off": cache_deltas},
     )
     print()
     print(text)
@@ -333,10 +510,11 @@ def report(out):
 def _stats(rows):
     ok = [r for r in rows if r["status"] == "ok"]
     passed = [r for r in ok if r["passed"]]
-    over_by = [r["over_limit_by"] for r in ok if r.get("over_limit")]  # .get: runs from before the soft limit
+    limited = [r for r in ok if r.get("over_limit") is not None]  # .get: runs from before the soft limit
+    over_by = [r["over_limit_by"] for r in limited if r["over_limit"]]
 
     def values(column):
-        return [r[column] for r in ok if r[column] is not None]
+        return [r[column] for r in ok if r.get(column) is not None]
 
     def mean(column):
         return statistics.fmean(values(column)) if values(column) else None
@@ -347,8 +525,17 @@ def _stats(rows):
         "pass_rate": len(passed) / len(ok) if ok else None,
         "check_pass_rate": sum(1 for r in ok if r["check"]) / len(ok) if ok else None,
         "jev_passed": sum(1 for r in passed if not r["check"]),
+        "cache_hits": sum(r.get("cache_status") == "hit" for r in rows),
+        "cache_hit_rate": sum(r.get("cache_status") == "hit" for r in rows) / len(rows) if rows else None,
+        "unexpected_cache_hits": sum(r.get("cache_status") == "hit" and not r.get("cache_expected_hit") for r in rows),
+        "cache_reply_mismatches": sum(r.get("cache_reply_matches") is False for r in rows),
+        "limited_replies": len(limited),
         "over_limit": len(over_by),
+        "over_rate": len(over_by) / len(limited) if limited else None,
         "avg_over_by": statistics.fmean(over_by) if over_by else None,
+        "max_over_by": max(over_by, default=None),
+        "input_tokens_raw": mean("input_tokens_raw"),
+        "input_tokens_compressed": mean("input_tokens_compressed"),
         "input_tokens": mean("input_tokens_reported"),
         "output_tokens": mean("output_tokens"),
         "thought_tokens": mean("thought_tokens"),
@@ -358,7 +545,35 @@ def _stats(rows):
         "latency_max": max(values("latency_total_ms"), default=None),
         "upstream_avg": mean("latency_upstream_ms"),
         "compress_avg": mean("latency_compress_ms"),
+        "request_latency_avg": mean("request_latency_ms"),
+        "request_latency_p50": _percentile(values("request_latency_ms"), 0.50),
+        "request_latency_p95": _percentile(values("request_latency_ms"), 0.95),
+        "attempts": sum(r.get("attempts", 1) for r in rows),
+        "input_tokens_sum": _known_sum(r.get("attempt_input_tokens", r.get("input_tokens_reported")) for r in rows),
+        "output_tokens_sum": _known_sum(r.get("attempt_output_tokens", r.get("output_tokens")) for r in rows),
+        "total_tokens_sum": _known_sum(r.get("attempt_total_tokens", r.get("total_tokens")) for r in rows),
+        "unknown_usage_attempts": sum(r.get("unknown_usage_attempts", int(r.get("total_tokens") is None)) for r in rows),
     }
+
+
+def _stats_key(test, pipeline, mode, modes):
+    # Retain the original report.json keys for the default cache-off run.
+    return f"{test}/{pipeline}" if modes == ["off"] else f"{test}/{pipeline}/{mode}"
+
+
+def _known_sum(values):
+    known = [value for value in values if value is not None]
+    return sum(known) if known else None
+
+
+def _percentile(values, fraction):
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
 def _change(value, base):
@@ -429,13 +644,19 @@ def cli(argv=None):
     run_parser.add_argument("--tests", nargs="+", choices=list(case_lib.TESTS), default=list(case_lib.TESTS),
                             help="tests to run (default: all, see `list`)")
     add_grade_args(run_parser)
-    run_parser.add_argument("--stages", dest="pipelines", metavar="COMBO", nargs="+", default=[BASELINE],
-                            help=f"stage combinations to compare, e.g. none a a+b (default: {BASELINE}; "
-                                 f"stages: {', '.join(sorted(compression.STAGES))})")
+    run_parser.add_argument("--stages", "--pipelines", dest="pipelines", metavar="COMBO", nargs="+", default=[BASELINE],
+                            help=f"stage combinations or presets, e.g. none code code+concise full "
+                                 f"(default: {BASELINE}; stages: {', '.join(sorted(compression.STAGES))}; "
+                                 f"presets: {', '.join(compression.PIPELINES)})")
+    run_parser.add_argument("--cache-modes", nargs="+", choices=list(CACHE_MODES), default=["off"],
+                            help="cache phases: off bypasses caching, cold refreshes every request, "
+                                 "warm starts empty then reuses exact repeats (default off)")
     run_parser.add_argument("--limits", nargs="+", type=_limit, default=[DEFAULT_LIMIT],
                             help=f"soft output limits to compare: numbers, {NO_LIMIT} for no limit or "
                                  f"{DEFAULT_LIMIT} for the server's (default: {DEFAULT_LIMIT}); "
                                  f"{NO_LIMIT} is the baseline if listed")
+    run_parser.add_argument("--save-replies", action="store_true",
+                            help="explicitly save response text to enable later regrading; omitted by default")
     run_parser.add_argument("--repeats", type=int, default=3, help="times each test is sent per combination (default 3)")
     run_parser.add_argument("--seed", type=int, default=0, help="seed for the call order (default 0)")
     run_parser.add_argument("--delay", type=float, default=0, help="seconds to wait between calls (default 0)")

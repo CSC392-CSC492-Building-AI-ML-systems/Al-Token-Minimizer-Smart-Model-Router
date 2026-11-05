@@ -46,7 +46,9 @@ COLUMNS = {
     "model": "TEXT",
     "interaction_id": "TEXT",  # Gemini's id for the interaction
     "prompt_hash": "TEXT",  # never the prompt itself
-    "compression": "TEXT",  # compression stages used, e.g. "a+b" ("none" when off), see pipeline.label()
+    "compression": "TEXT",  # ordered stage label, e.g. "code+concise" or "none"
+    "compression_version": "TEXT",
+    "cache_status": "TEXT CHECK (cache_status IN ('off', 'disabled', 'miss', 'hit', 'refresh'))",
     # tokens
     "input_tokens_raw": "INTEGER",  # our count before compression
     "input_tokens_compressed": "INTEGER",  # same as raw until compression exists
@@ -69,7 +71,7 @@ COLUMNS = {
     % ", ".join(f"'{s}'" for s in STATUSES),
     "http_status": "INTEGER",  # HTTP code for upstream_error (2xx if the body couldn't be read), else NULL
     "error_type": "TEXT",  # exception class, or Gemini's raw status for not_completed
-    "error_message": "TEXT",  # Gemini's errors or the exception's message, never the response body
+    "error_message": "TEXT",  # legacy field; /ask leaves free-form messages unset for privacy
     "cost_usd": "REAL",  # NULL if the model has no price
 }
 
@@ -113,6 +115,8 @@ class RequestRecord:
     interaction_id: str | None = None
     prompt_hash: str | None = None
     compression: str | None = None
+    compression_version: str | None = None
+    cache_status: str | None = None
     # tokens
     input_tokens_raw: int | None = None
     input_tokens_compressed: int | None = None
@@ -284,7 +288,7 @@ def summarize_requests(db_path=None, model=None, status=None, since=None, until=
     """
     where, params = _where_clause(model=model, status=status, since=since, until=until)
     columns = [
-        "model", "timestamp", "status", "cost_usd", "over_limit", "over_limit_by",
+        "model", "timestamp", "status", "cost_usd", "cache_status", "over_limit", "over_limit_by",
         *TOKEN_COLUMNS, *LATENCY_COLUMNS.values(),
     ]
     sql = f"SELECT {', '.join(columns)} FROM requests{where}"
@@ -316,6 +320,7 @@ class _Totals:
         self.tokens_saved = None  # raw - compressed, over those same rows
         self.cost = None
         self.priced_requests = 0
+        self.cache_counts = dict.fromkeys(("off", "disabled", "miss", "hit", "refresh", "unknown"), 0)
         self.limited_replies = 0  # rows with a soft output limit and an output count
         self.over_by = []  # over_limit_by of the rows that went over
         self.latencies = {name: [] for name in LATENCY_COLUMNS}
@@ -328,6 +333,7 @@ class _Totals:
         if self.last_timestamp is None or timestamp > self.last_timestamp:
             self.last_timestamp = timestamp
         self.status_counts[row["status"]] = self.status_counts.get(row["status"], 0) + 1
+        self.cache_counts[row["cache_status"] or "unknown"] += 1
 
         for column in TOKEN_COLUMNS:
             self.tokens[column] = _add(self.tokens[column], row[column])
@@ -360,6 +366,10 @@ class _Totals:
             "compression": {
                 "tokens_saved": self.tokens_saved,
                 "saved_rate": _ratio(self.tokens_saved, self.raw_tokens_compressed),
+            },
+            "cache": {
+                "status_counts": dict(self.cache_counts),
+                "hit_rate": _ratio(self.cache_counts["hit"], self.cache_counts["hit"] + self.cache_counts["miss"]),
             },
             "cost_usd": {
                 "total": self.cost,
@@ -426,6 +436,8 @@ def format_summary(summary):
         f"{cost['unpriced_requests']:,} unpriced",
         f"compression   {_fmt_num(compression['tokens_saved'])} input tokens saved "
         f"({_fmt_pct(compression['saved_rate'])})",
+        f"cache         {summary['cache']['status_counts']['hit']:,} hits "
+        f"({_fmt_pct(summary['cache']['hit_rate'])} of lookups)",
         f"output limit  {limit['over_limit']:,} of {limit['limited_replies']:,} replies went over the soft limit "
         f"({_fmt_pct(limit['over_rate'])}), by {_fmt_num(limit['avg_over_by'])} tokens on average "
         f"(max {_fmt_num(limit['max_over_by'])})",
@@ -491,8 +503,7 @@ def cli(argv=None):
     if args.command != "summary":
         print(f"Initialized {init_db(path)}")
         return
-    if not path.exists():
-        init_db(path)  # so `summary` works on a fresh clone; an existing db is only read
+    init_db(path)  # migrate old schemas as well as initialize a fresh clone
     summary = summarize_requests(path, model=args.model, status=args.status, since=args.since, until=args.until)
     if args.json:
         print(json.dumps(summary, indent=2))

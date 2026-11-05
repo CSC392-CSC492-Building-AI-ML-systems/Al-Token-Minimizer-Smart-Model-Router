@@ -8,6 +8,7 @@ Run from the project folder:
 
 import json
 import os
+import sqlite3
 import statistics
 from datetime import datetime, timedelta, timezone
 
@@ -63,6 +64,18 @@ def test_empty_db(db_path):
     }
     assert summary["latency_ms"] == dict.fromkeys(db.LATENCY_COLUMNS, NO_LATENCY)
     assert summary["by_model"] == []
+
+
+def test_cache_summary_distinguishes_lookups_from_bypasses(db_path):
+    for minute, status in enumerate((None, "off", "disabled", "miss", "hit", "hit", "refresh")):
+        add(db_path, minute, cache_status=status, total_tokens=0 if status == "hit" else 12)
+    summary = db.summarize_requests(db_path)
+    assert summary["cache"]["status_counts"] == {
+        "unknown": 1, "off": 1, "disabled": 1, "miss": 1, "hit": 2, "refresh": 1,
+    }
+    assert summary["cache"]["hit_rate"] == pytest.approx(2 / 3)
+    assert summary["tokens"]["total_tokens"] == 60
+    assert summary["by_model"][0]["cache"] == summary["cache"]
 
 
 def test_soft_output_limit(db_path):
@@ -361,6 +374,21 @@ def test_cli_summary_creates_missing_db(tmp_path, monkeypatch, capsys):
 
     assert json.loads(capsys.readouterr().out)["requests"] == 0
     assert path.exists()
+
+
+def test_cli_summary_migrates_existing_db(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "old.db"
+    monkeypatch.setenv("TELEMETRY_DB_PATH", str(path))
+    columns = {name: kind for name, kind in db.COLUMNS.items()
+               if name not in ("cache_status", "compression_version")}
+    with sqlite3.connect(path) as conn:
+        conn.execute(f"CREATE TABLE requests ({', '.join(f'{name} {kind}' for name, kind in columns.items())})")
+        conn.execute("INSERT INTO requests (request_id, timestamp, status) VALUES ('old', '2026-10-01T00:00:00+00:00', 'ok')")
+    db.cli(["summary", "--json"])
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["requests"] == 1
+    assert summary["cache"]["status_counts"]["unknown"] == 1
+    assert db.fetch_requests(path)[0]["request_id"] == "old"
 
 
 def test_cli_no_args_still_initializes(tmp_path, monkeypatch, capsys):

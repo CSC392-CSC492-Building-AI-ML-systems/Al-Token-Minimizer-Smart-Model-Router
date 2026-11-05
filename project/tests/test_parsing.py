@@ -123,7 +123,7 @@ def test_reply_with_errors_is_not_ok(monkeypatch, client):
     fake_gemini(monkeypatch, reply=real_shaped_reply(errors=errors))
     row = ask_and_get_row(client)
     assert row["status"] == db.STATUS_NOT_COMPLETED
-    assert "something broke" in row["error_message"]
+    assert row["error_message"] is None
 
 
 class FakeHttpError(Exception):
@@ -231,27 +231,27 @@ def test_real_sdk_cant_connect(monkeypatch, client):
     row = ask_and_get_row(client)
     assert row["status"] == db.STATUS_CONNECTION_ERROR
     assert row["error_type"] == "APIConnectionError"
-    assert row["error_message"] == "no route"
+    assert row["error_message"] is None
 
 
-def test_real_sdk_http_error_keeps_geminis_message(monkeypatch, client):
+def test_real_sdk_http_error_keeps_metadata_only(monkeypatch, client):
     error = {"error": {"code": 400, "message": "Request contains an invalid argument.", "status": "INVALID_ARGUMENT"}}
     fake_gemini_http(monkeypatch, lambda request: httpx.Response(400, json=error))
     row = ask_and_get_row(client)
     assert row["status"] == db.STATUS_UPSTREAM_ERROR
     assert row["http_status"] == 400
     assert row["error_type"] == "BadRequestError"
-    assert row["error_message"] == "INVALID_ARGUMENT: Request contains an invalid argument."
+    assert row["error_message"] is None
 
 
-def test_real_sdk_http_error_in_a_list_keeps_geminis_message(monkeypatch, client):
+def test_real_sdk_http_error_in_a_list_keeps_metadata_only(monkeypatch, client):
     # the shape a project with no prepaid credits left gets back (message shortened)
     error = [{"error": {"code": 402, "message": "Your prepayment credits are depleted.", "status": "RESOURCE_EXHAUSTED"}}]
     fake_gemini_http(monkeypatch, lambda request: httpx.Response(402, json=error))
     row = ask_and_get_row(client)
     assert row["status"] == db.STATUS_UPSTREAM_ERROR
     assert row["http_status"] == 402
-    assert row["error_message"] == "RESOURCE_EXHAUSTED: Your prepayment credits are depleted."
+    assert row["error_message"] is None
 
 
 @pytest.mark.parametrize(
@@ -352,4 +352,4 @@ def test_real_sdk_errors_that_arent_a_list(monkeypatch, client, errors, message)
 
     assert response.status_code == 200
     assert row["status"] == db.STATUS_NOT_COMPLETED
-    assert row["error_message"] == message
+    assert row["error_message"] is None

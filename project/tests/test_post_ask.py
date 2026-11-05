@@ -85,8 +85,8 @@ def test_post_ask_returns_text_and_saves_row(monkeypatch, client):
     assert row["compression"] == "none"
     assert row["latency_compress_ms"] >= 0
     assert row["latency_count_ms"] >= 0
-    assert row["input_tokens_raw"] == 1
-    assert row["input_tokens_compressed"] == 1
+    assert row["input_tokens_raw"] == 3  # user text plus system instruction
+    assert row["input_tokens_compressed"] == 3
     assert row["input_tokens_reported"] == 12
 
 
@@ -229,18 +229,123 @@ def test_unknown_stage_raises():
         pipeline.compress(pipeline.Prompt("hi"), ["nope"])
 
 
+def test_unknown_preset_rejected(client):
+    assert client.post("/ask", json={"prompt": "hi", "compression": "unknown"}).status_code == 422
+    assert db.fetch_requests() == []
+
+
+def test_preset_and_stage_list_are_mutually_exclusive(client):
+    response = client.post("/ask", json={"prompt": "hi", "compression": "light", "stages": []})
+    assert response.status_code == 422
+    assert db.fetch_requests() == []
+
+
+def test_explicit_empty_stages_override_configured_default(monkeypatch, client):
+    sent = []
+    monkeypatch.setattr(main, "DEFAULT_COMPRESSION", "light")
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.append(kw) or ok_reply())
+    # no soft limit, so the system prompt is only what the stages made
+    client.post("/ask", json={"prompt": "hi", "soft_output_limit": None})
+    client.post("/ask", json={"prompt": "hi", "stages": [], "soft_output_limit": None})
+    assert sent[0]["system_instruction"] == pipeline.CONCISE_INSTRUCTION
+    assert "system_instruction" not in sent[1]
+    assert [row["compression"] for row in db.fetch_requests()] == ["concise", "none"]
+
+
+def test_equivalent_preset_and_stage_list_share_cache(monkeypatch, client):
+    from response_cache import ResponseCache
+
+    monkeypatch.setattr(main, "response_cache", ResponseCache())
+    calls = []
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: calls.append(kw) or ok_reply())
+    original = client.post("/ask", json={"prompt": "hi", "compression": "full", "cache": "use"})
+    repeated = client.post("/ask", json={"prompt": "hi", "stages": ["code", "concise"], "cache": "use"})
+    assert original.json()["cache_status"] == "miss"
+    assert repeated.json()["cache_status"] == "hit"
+    assert len(calls) == 1
+    assert all(row["compression"] == "code+concise" for row in db.fetch_requests())
+
+
+def test_soft_limit_is_part_of_cache_identity(monkeypatch, client):
+    from response_cache import ResponseCache
+
+    monkeypatch.setattr(main, "response_cache", ResponseCache())
+    calls = []
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: calls.append(kw) or long_reply(150))
+    first = client.post("/ask", json={"prompt": "hi", "cache": "use", "soft_output_limit": 100})
+    other_limit = client.post("/ask", json={"prompt": "hi", "cache": "use", "soft_output_limit": 500})
+    same_limit = client.post("/ask", json={"prompt": "hi", "cache": "use", "soft_output_limit": 100})
+
+    assert [r.json()["cache_status"] for r in (first, other_limit, same_limit)] == ["miss", "miss", "hit"]
+    assert len(calls) == 2
+    # a hit generates nothing new, so it isn't flagged as going over
+    assert first.json()["over_limit"] is True and same_limit.json()["over_limit"] is False
+    hit_row = db.fetch_requests(request_id=same_limit.json()["request_id"])[0]
+    assert hit_row["over_limit"] is None and hit_row["soft_output_limit"] == 100
+
+
+def test_soft_limit_goes_after_the_concise_instruction(monkeypatch, client):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
+
+    client.post("/ask", json={"prompt": "hi", "compression": "light", "system": "be nice", "soft_output_limit": 200})
+
+    assert sent["system_instruction"] == f"{pipeline.CONCISE_INSTRUCTION}\n\nbe nice\n\n{main.length_hint(200)}"
+
+
+def test_context_is_sent_counted_and_included_in_cache_identity(monkeypatch):
+    from response_cache import ResponseCache
+
+    monkeypatch.setattr(main, "response_cache", ResponseCache())
+    sent = []
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.append(kw) or ok_reply())
+    first = pipeline.Prompt("question", "system", (pipeline.Chunk("first content", "a.txt"),))
+    second = pipeline.Prompt("question", "system", (pipeline.Chunk("different content", "a.txt"),))
+    for prompt in (first, second, first):
+        record = db.RequestRecord(model=main.MODEL)
+        main._answer(record, prompt, (), "use")
+    assert [request["input"] for request in sent] == [first.render(), second.render()]
+    rows = db.fetch_requests()
+    assert [row["cache_status"] for row in rows] == ["miss", "miss", "hit"]
+    assert rows[0]["input_tokens_raw"] == len(first.render().split()) + 1
+
+
+def test_equal_rendered_text_with_different_chunk_boundaries_does_not_share_cache(monkeypatch):
+    from response_cache import ResponseCache
+
+    monkeypatch.setattr(main, "response_cache", ResponseCache())
+    monkeypatch.setattr(main.model_package.tokenizer, "count", len)
+    sent = []
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.append(kw) or ok_reply())
+    opening = "```python\nx    =    1"
+    closing = "```"
+    first = pipeline.Prompt("question", context=(pipeline.Chunk(opening + "\n\n" + closing),))
+    second = pipeline.Prompt("question", context=(pipeline.Chunk(opening), pipeline.Chunk(closing)))
+    assert first.render() == second.render()
+    for prompt in (first, second):
+        main._answer(db.RequestRecord(model=main.MODEL), prompt, ("code",), "use")
+    assert len(sent) == 2
+    assert sent[0]["input"] != sent[1]["input"]
+    assert [row["cache_status"] for row in db.fetch_requests()] == ["miss", "miss"]
+
+
 # ---------------------------------------------------------------- db migration
 
 
 def test_init_db_adds_new_columns_to_an_old_db(tmp_path):
     path = tmp_path / "old.db"
-    old_columns = {k: v for k, v in db.COLUMNS.items() if k not in ("compression", "latency_compress_ms")}
+    old_columns = {k: v for k, v in db.COLUMNS.items() if k not in (
+        "compression", "latency_compress_ms", "compression_version", "cache_status",
+    )}
     with sqlite3.connect(path) as conn:
         conn.execute(f"CREATE TABLE requests ({', '.join(f'{k} {v}' for k, v in old_columns.items())})")
         conn.execute("INSERT INTO requests (request_id, timestamp, status) VALUES ('old', '2026-10-01T00:00:00+00:00', 'ok')")
     db.init_db(path)
 
-    db.insert_request(db.RequestRecord(status=db.STATUS_OK, compression="none", latency_compress_ms=0.1), path)
+    db.insert_request(db.RequestRecord(status=db.STATUS_OK, compression="none", latency_compress_ms=0.1,
+                                       compression_version="1", cache_status="hit"), path)
 
     rows = db.fetch_requests(path)
     assert [r["compression"] for r in rows] == [None, "none"]
+    assert [r["cache_status"] for r in rows] == [None, "hit"]
+    assert [r["compression_version"] for r in rows] == [None, "1"]
