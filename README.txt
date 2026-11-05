@@ -29,24 +29,23 @@ POST /ask takes a JSON body instead of a query string (use it for long prompts):
 
 {"prompt": "...", "system": "optional system prompt", "stages": ["passthrough"]}
 
-it returns {"text": ..., "request_id": ..., "truncated": false}. stages are the compression stages
+it returns {"text": ..., "request_id": ..., "over_limit": false}. stages are the compression stages
 to run, in order (leave it out for none). each stage is a file in
 compressor/stages/, see compressor/pipeline.py for how to add one.
 
-OUTPUT CAP
+SOFT OUTPUT LIMIT
 
-replies are capped at 4096 tokens by default (DEFAULT_MAX_OUTPUT_TOKENS in main.py).
-send "max_output_tokens": 500 to use your own cap, or "max_output_tokens": null
-for none (GET /ask takes it as a query parameter). gemini's thinking counts
-toward the cap, so small caps can get used up before the answer starts.
+there's no hard cap on replies, so nothing ever gets cut off. instead the
+system prompt asks gemini to aim for under 1024 output tokens by default
+(DEFAULT_SOFT_OUTPUT_LIMIT in main.py), and to always finish its answer anyway.
+send "soft_output_limit": 500 to ask for a different length, or
+"soft_output_limit": null for no limit (GET /ask takes it as a query parameter).
+the limit is on the answer only, thinking tokens aren't counted.
 
-when a reply hits the cap:
-- plain text comes back cut short, with "truncated": true
-- JSON, HTML, code blocks or an empty reply would be broken cut short, so the
-  server asks gemini again with no cap and returns the full reply (the db row
-  has cap_retry = 1 and its token counts cover both calls)
-
-every row in the db records max_output_tokens, truncated and cap_retry.
+a reply that goes over is still sent back whole, with "over_limit": true. every
+row in the db records soft_output_limit, over_limit (1/0) and over_limit_by
+(how many output tokens over), and the log line for it is a WARNING.
+uv run python db.py summary shows how many replies went over and by how much.
 
 
 BENCHMARK
@@ -56,7 +55,7 @@ from the project folder:
 uv run python -m benchmark run                            (baseline, 30 calls)
 uv run python -m benchmark run --repeats 1                (barebones, 10 calls)
 uv run python -m benchmark run --stages none a a+b         (compare no stages, stage a, and a then b)
-uv run python -m benchmark run --caps none 1024 4096       (compare output caps against no cap)
+uv run python -m benchmark run --limits none 512 1024      (compare soft output limits against no limit)
 
 results go in benchmark/results/<time>/report.md. --help for all options.
 For reading the .md file VS code should be able to render the table in markdown if you righclick on the file and click Open preview 
