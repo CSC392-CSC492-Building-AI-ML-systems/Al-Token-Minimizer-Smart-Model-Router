@@ -61,7 +61,7 @@ def real_shaped_reply(**overrides):
 
 
 def fake_gemini(monkeypatch, reply=None, error=None):
-    def create(model, input, generation_config=None):
+    def create(model, input, system_instruction=None):
         if error:
             raise error
         return reply
@@ -112,7 +112,6 @@ def test_missing_usage_does_not_break_the_row(monkeypatch, client):
 
 
 def test_not_completed_reply(monkeypatch, client):
-    # ("incomplete" is how Gemini says it hit the output cap, see test_post_ask.py)
     fake_gemini(monkeypatch, reply=real_shaped_reply(status="failed"))
     row = ask_and_get_row(client)
     assert row["status"] == db.STATUS_NOT_COMPLETED

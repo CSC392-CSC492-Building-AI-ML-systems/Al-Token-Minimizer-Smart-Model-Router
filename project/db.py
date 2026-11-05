@@ -55,10 +55,10 @@ COLUMNS = {
     "thought_tokens": "INTEGER", # from gemini
     "cached_tokens": "INTEGER", # from gemini
     "total_tokens": "INTEGER", # from gemini
-    # output cap
-    "max_output_tokens": "INTEGER",  # cap sent to Gemini (thinking counts toward it), NULL for no cap
-    "truncated": "INTEGER",  # 1 if the reply sent back was cut off at the cap
-    "cap_retry": "INTEGER",  # 1 if a structured reply hit the cap and was asked again uncapped (tokens are both calls)
+    # soft output limit (asked for in the prompt, nothing is cut off)
+    "soft_output_limit": "INTEGER",  # output tokens the reply was asked to stay under, NULL for no limit
+    "over_limit": "INTEGER",  # 1 if output_tokens went over it, 0 if not, NULL if no limit or no count
+    "over_limit_by": "INTEGER",  # output_tokens - soft_output_limit, 0 if under
     # latency, in milliseconds
     "latency_total_ms": "REAL",
     "latency_upstream_ms": "REAL",
@@ -121,10 +121,10 @@ class RequestRecord:
     thought_tokens: int | None = None
     cached_tokens: int | None = None
     total_tokens: int | None = None
-    # output cap
-    max_output_tokens: int | None = None
-    truncated: int | None = None
-    cap_retry: int | None = None
+    # soft output limit
+    soft_output_limit: int | None = None
+    over_limit: int | None = None
+    over_limit_by: int | None = None
     # latency, in milliseconds
     latency_total_ms: float | None = None
     latency_upstream_ms: float | None = None
@@ -283,7 +283,10 @@ def summarize_requests(db_path=None, model=None, status=None, since=None, until=
     numbers for each model, sorted by name, with rows that have no model last.
     """
     where, params = _where_clause(model=model, status=status, since=since, until=until)
-    columns = ["model", "timestamp", "status", "cost_usd", *TOKEN_COLUMNS, *LATENCY_COLUMNS.values()]
+    columns = [
+        "model", "timestamp", "status", "cost_usd", "over_limit", "over_limit_by",
+        *TOKEN_COLUMNS, *LATENCY_COLUMNS.values(),
+    ]
     sql = f"SELECT {', '.join(columns)} FROM requests{where}"
 
     overall, per_model = _Totals(), {}
@@ -313,6 +316,8 @@ class _Totals:
         self.tokens_saved = None  # raw - compressed, over those same rows
         self.cost = None
         self.priced_requests = 0
+        self.limited_replies = 0  # rows with a soft output limit and an output count
+        self.over_by = []  # over_limit_by of the rows that went over
         self.latencies = {name: [] for name in LATENCY_COLUMNS}
 
     def add(self, row):
@@ -335,6 +340,11 @@ class _Totals:
             self.cost = _add(self.cost, row["cost_usd"])
             self.priced_requests += 1
 
+        if row["over_limit"] is not None:
+            self.limited_replies += 1
+            if row["over_limit"]:
+                self.over_by.append(row["over_limit_by"])
+
         for name, column in LATENCY_COLUMNS.items():
             if row[column] is not None:
                 self.latencies[name].append(row[column])
@@ -355,6 +365,13 @@ class _Totals:
                 "total": self.cost,
                 "avg_per_priced_request": _ratio(self.cost, self.priced_requests),
                 "unpriced_requests": self.requests - self.priced_requests,
+            },
+            "soft_output_limit": {
+                "limited_replies": self.limited_replies,
+                "over_limit": len(self.over_by),
+                "over_rate": _ratio(len(self.over_by), self.limited_replies),
+                "avg_over_by": _ratio(sum(self.over_by), len(self.over_by)),
+                "max_over_by": max(self.over_by, default=None),
             },
             "latency_ms": {name: _latency_stats(values) for name, values in self.latencies.items()},
         }
@@ -398,7 +415,7 @@ def format_summary(summary):
     if not summary["requests"]:
         return "No requests stored (for these filters)."
 
-    cost, compression = summary["cost_usd"], summary["compression"]
+    cost, compression, limit = summary["cost_usd"], summary["compression"], summary["soft_output_limit"]
     statuses = ", ".join(f"{name} {count:,}" for name, count in summary["status_counts"].items() if count)
     lines = [
         f"requests      {summary['requests']:,}  "
@@ -409,6 +426,9 @@ def format_summary(summary):
         f"{cost['unpriced_requests']:,} unpriced",
         f"compression   {_fmt_num(compression['tokens_saved'])} input tokens saved "
         f"({_fmt_pct(compression['saved_rate'])})",
+        f"output limit  {limit['over_limit']:,} of {limit['limited_replies']:,} replies went over the soft limit "
+        f"({_fmt_pct(limit['over_rate'])}), by {_fmt_num(limit['avg_over_by'])} tokens on average "
+        f"(max {_fmt_num(limit['max_over_by'])})",
         "",
         "tokens",
     ]

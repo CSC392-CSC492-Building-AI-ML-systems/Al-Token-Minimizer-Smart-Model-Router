@@ -65,6 +65,30 @@ def test_empty_db(db_path):
     assert summary["by_model"] == []
 
 
+def test_soft_output_limit(db_path):
+    add(db_path, 0, soft_output_limit=100, output_tokens=80, over_limit=0, over_limit_by=0)
+    add(db_path, 1, soft_output_limit=100, output_tokens=150, over_limit=1, over_limit_by=50)
+    add(db_path, 2, soft_output_limit=100, output_tokens=250, over_limit=1, over_limit_by=150)
+    add(db_path, 3, output_tokens=999)  # no limit, left out
+    add(db_path, 4, status=db.STATUS_TIMEOUT, soft_output_limit=100)  # no reply, left out
+
+    assert db.summarize_requests(db_path)["soft_output_limit"] == {
+        "limited_replies": 3,
+        "over_limit": 2,
+        "over_rate": pytest.approx(2 / 3),
+        "avg_over_by": 100,
+        "max_over_by": 150,
+    }
+
+
+def test_soft_output_limit_with_nothing_limited(db_path):
+    add(db_path, 0, output_tokens=10)
+
+    assert db.summarize_requests(db_path)["soft_output_limit"] == {
+        "limited_replies": 0, "over_limit": 0, "over_rate": None, "avg_over_by": None, "max_over_by": None,
+    }
+
+
 def test_totals(db_path):
     # inserted out of time order, like requests that finish in a different order than they start
     add(db_path, 3, status=db.STATUS_UPSTREAM_ERROR, http_status=429)

@@ -4,7 +4,7 @@ From the project folder:
     uv run python -m benchmark run                      # baseline: every test 3 times, no stages ("none")
     uv run python -m benchmark run --stages none a a+b --repeats 5   # compare no stages, stage a, and a then b
     uv run python -m benchmark run --tests orders_json verbose_json --repeats 1
-    uv run python -m benchmark run --caps none 1024 4096     # compare output caps against no cap
+    uv run python -m benchmark run --limits none 512 1024    # compare soft output limits against no limit
     uv run python -m benchmark grade benchmark/results/<run>   # re-grade (e.g. after changing a check)
     uv run python -m benchmark report benchmark/results/<run>  # rebuild the report
     uv run python -m benchmark list                     # show the tests and their sizes
@@ -21,9 +21,9 @@ Requests go through POST /ask in this process (FastAPI's TestClient), so they
 take the same path as real traffic, compression and telemetry included,
 without needing the server running. A "pipeline" here is a combination of
 compression stages written as a label: "none", "a" or "a+b" (stage a, then b).
-With --caps it's also an output cap, e.g. "none cap=1024" (max_output_tokens
-1024) or "none cap=none" (no cap); without it every call gets the server's
-default cap and pipelines are named by their stages alone.
+With --limits it's also a soft output limit, e.g. "none limit=1024"
+(soft_output_limit 1024) or "none limit=none" (no limit); without it every call
+gets the server's default limit and pipelines are named by their stages alone.
 Each repeat runs every (test, pipeline)
 pair in a shuffled order, so pipelines are compared under the same Gemini load
 instead of one after the other.
@@ -48,8 +48,8 @@ from compressor import pipeline as compression
 
 RESULTS_DIR = Path(__file__).parent / "results"
 BASELINE = "none"  # no stages; every other combination is compared against it
-DEFAULT_CAP = "default"  # --caps value that leaves max_output_tokens to the server
-NO_CAP = "none"  # --caps value that sends max_output_tokens: null
+DEFAULT_LIMIT = "default"  # --limits value that leaves soft_output_limit to the server
+NO_LIMIT = "none"  # --limits value that sends soft_output_limit: null
 
 # Copied from the request's db row into results.jsonl.
 ROW_COLUMNS = (
@@ -62,9 +62,9 @@ ROW_COLUMNS = (
     "thought_tokens",
     "cached_tokens",
     "total_tokens",
-    "max_output_tokens",
-    "truncated",
-    "cap_retry",
+    "soft_output_limit",
+    "over_limit",
+    "over_limit_by",
     "latency_total_ms",
     "latency_upstream_ms",
     "latency_compress_ms",
@@ -92,17 +92,17 @@ def run(args):
     db.init_db()  # in case main was already imported (e.g. in tests) with another db
     client = TestClient(main.app, raise_server_exceptions=False)
     case_list = [case_lib.TESTS[name] for name in args.tests]
-    variants = [(stages, cap) for stages in args.pipelines for cap in args.caps]
-    names = {variant: _variant_name(*variant, args.caps) for variant in variants}
-    baseline_cap = NO_CAP if NO_CAP in args.caps else args.caps[0]
+    variants = [(stages, limit) for stages in args.pipelines for limit in args.limits]
+    names = {variant: _variant_name(*variant, args.limits) for variant in variants}
+    baseline_limit = NO_LIMIT if NO_LIMIT in args.limits else args.limits[0]
     meta = {
         "started_at": _now(),
         "model": main.MODEL,
         "pipelines": list(names.values()),
-        "baseline": _variant_name(BASELINE, baseline_cap, args.caps),
+        "baseline": _variant_name(BASELINE, baseline_limit, args.limits),
         "stages": args.pipelines,
-        "caps": args.caps,
-        "default_max_output_tokens": main.DEFAULT_MAX_OUTPUT_TOKENS,
+        "limits": args.limits,
+        "default_soft_output_limit": main.DEFAULT_SOFT_OUTPUT_LIMIT,
         "tests": args.tests,
         "repeats": args.repeats,
         "seed": args.seed,
@@ -153,16 +153,16 @@ def run(args):
     return out
 
 
-def _variant_name(stages, cap, caps):
-    """How a (stages, cap) pair is shown: just the stages when only the default cap is run."""
-    return stages if caps == [DEFAULT_CAP] else f"{stages} cap={cap}"
+def _variant_name(stages, limit, limits):
+    """How a (stages, limit) pair is shown: just the stages when only the default limit is run."""
+    return stages if limits == [DEFAULT_LIMIT] else f"{stages} limit={limit}"
 
 
-def _call(client, db, case, stages, cap, args):
+def _call(client, db, case, stages, limit, args):
     """POST the case to /ask, retrying rate limits and timeouts. Returns the results.jsonl fields."""
     body = {"prompt": case.prompt, "system": case.system, "stages": compression.parse_label(stages)}
-    if cap != DEFAULT_CAP:
-        body["max_output_tokens"] = None if cap == NO_CAP else cap
+    if limit != DEFAULT_LIMIT:
+        body["soft_output_limit"] = None if limit == NO_LIMIT else limit
     for attempt in range(1, args.retries + 2):
         response = client.post("/ask", json=body)
         payload = response.json()
@@ -245,12 +245,12 @@ def report(out):
         *([f"**Stopped early: {meta['stopped_early']}.**", ""] if meta.get("stopped_early") else []),
         "Pass rate is over the calls that got a reply (errors are counted separately). "
         "\"Jev\" is how many failed checks Jev passed. Tokens are means as reported by Gemini. "
-        "\"Cut off\" is how many replies stopped at the output cap and were sent back short, "
-        "\"re-asked\" how many hit it as JSON/code and were asked again without a cap (their tokens are both calls). "
+        "\"Over limit\" is how many replies went over their soft output limit, "
+        "\"avg over by\" how many output tokens over, on average, for those. "
         "Times are in ms, over the calls that got a reply: \"total\" is the whole /ask request "
         "(what a user waits for), \"upstream\" is the Gemini call alone, \"compress\" is the compression pipeline.",
         "",
-        "| test | pipeline | calls | errors | pass | Jev | cut off | re-asked | input tok | output tok | thought tok "
+        "| test | pipeline | calls | errors | pass | Jev | over limit | avg over by | input tok | output tok | thought tok "
         "| total tok | total avg | fastest | slowest | upstream avg | compress avg |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
@@ -261,13 +261,13 @@ def report(out):
                 continue
             lines.append(
                 f"| {test} | {name} | {s['calls']} | {s['errors']} | {_pct(s['pass_rate'])} | {s['jev_passed']} "
-                f"| {s['truncated']} | {s['cap_retries']} "
+                f"| {s['over_limit']} | {_num(s['avg_over_by'])} "
                 f"| {_num(s['input_tokens'])} | {_num(s['output_tokens'])} | {_num(s['thought_tokens'])} "
                 f"| {_num(s['total_tokens'])} | {_num(s['latency_avg'])} | {_num(s['latency_min'])} "
                 f"| {_num(s['latency_max'])} | {_num(s['upstream_avg'])} | {_num(s['compress_avg'], 2)} |"
             )
 
-    baseline = meta.get("baseline", BASELINE)  # runs from before --caps don't have it
+    baseline = meta.get("baseline", BASELINE)  # runs from before --limits don't have it
     compared = [p for p in pipelines if p != baseline]
     deltas = {}
     if baseline in pipelines and compared:
@@ -333,6 +333,7 @@ def report(out):
 def _stats(rows):
     ok = [r for r in rows if r["status"] == "ok"]
     passed = [r for r in ok if r["passed"]]
+    over_by = [r["over_limit_by"] for r in ok if r.get("over_limit")]  # .get: runs from before the soft limit
 
     def values(column):
         return [r[column] for r in ok if r[column] is not None]
@@ -346,8 +347,8 @@ def _stats(rows):
         "pass_rate": len(passed) / len(ok) if ok else None,
         "check_pass_rate": sum(1 for r in ok if r["check"]) / len(ok) if ok else None,
         "jev_passed": sum(1 for r in passed if not r["check"]),
-        "truncated": sum(1 for r in ok if r.get("truncated")),  # .get: runs from before the cap don't have it
-        "cap_retries": sum(1 for r in ok if r.get("cap_retry")),
+        "over_limit": len(over_by),
+        "avg_over_by": statistics.fmean(over_by) if over_by else None,
         "input_tokens": mean("input_tokens_reported"),
         "output_tokens": mean("output_tokens"),
         "thought_tokens": mean("thought_tokens"),
@@ -407,11 +408,11 @@ def list_tests():
         print(f"{case.name:<26} {case.category:<22} {size:>7,} chars  judge={case.judge}  expected {case.expected[:60]}")
 
 
-def _cap(text):
-    if text in (DEFAULT_CAP, NO_CAP):
+def _limit(text):
+    if text in (DEFAULT_LIMIT, NO_LIMIT):
         return text
     if not text.isdigit() or int(text) == 0:
-        raise argparse.ArgumentTypeError(f"expected a positive number, {NO_CAP} or {DEFAULT_CAP}, got {text!r}")
+        raise argparse.ArgumentTypeError(f"expected a positive number, {NO_LIMIT} or {DEFAULT_LIMIT}, got {text!r}")
     return int(text)
 
 
@@ -431,10 +432,10 @@ def cli(argv=None):
     run_parser.add_argument("--stages", dest="pipelines", metavar="COMBO", nargs="+", default=[BASELINE],
                             help=f"stage combinations to compare, e.g. none a a+b (default: {BASELINE}; "
                                  f"stages: {', '.join(sorted(compression.STAGES))})")
-    run_parser.add_argument("--caps", nargs="+", type=_cap, default=[DEFAULT_CAP],
-                            help=f"output caps (max_output_tokens) to compare: numbers, {NO_CAP} for no cap or "
-                                 f"{DEFAULT_CAP} for the server's cap (default: {DEFAULT_CAP}); "
-                                 f"{NO_CAP} is the baseline if listed")
+    run_parser.add_argument("--limits", nargs="+", type=_limit, default=[DEFAULT_LIMIT],
+                            help=f"soft output limits to compare: numbers, {NO_LIMIT} for no limit or "
+                                 f"{DEFAULT_LIMIT} for the server's (default: {DEFAULT_LIMIT}); "
+                                 f"{NO_LIMIT} is the baseline if listed")
     run_parser.add_argument("--repeats", type=int, default=3, help="times each test is sent per combination (default 3)")
     run_parser.add_argument("--seed", type=int, default=0, help="seed for the call order (default 0)")
     run_parser.add_argument("--delay", type=float, default=0, help="seconds to wait between calls (default 0)")
