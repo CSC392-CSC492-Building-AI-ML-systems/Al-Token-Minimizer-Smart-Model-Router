@@ -44,7 +44,7 @@ Alternatively send "stages": ["code", "concise"] in place of "compression".
 The stage list runs in order; an explicit [] disables compression. The two
 configuration fields are mutually exclusive. Omitting both uses the server default.
 
-Returns text, request_id, and cache_status. On upstream errors, POST returns
+Returns text, request_id, cache_status, and over_limit (see SOFT OUTPUT LIMIT). On upstream errors, POST returns
 an HTTP error and detail containing status and request_id. Partial model
 responses remain marked not_completed in telemetry and are never cached.
 Invalid request settings return 422 before provider calls.
@@ -96,6 +96,25 @@ input-token saving is valid when concise guidance adds more input than code save
 If code compaction increases the actual model token count, the service restores
 the original user text while retaining any selected concise-answer guidance.
 
+SOFT OUTPUT LIMIT (CSC-19)
+
+An optional add-on, off by default, so the compression levels above (none
+included) behave exactly as described unless a request asks for it. There is
+no hard cap on replies, so nothing is ever cut off. Send "soft_output_limit": 500
+(GET /ask takes it as a query parameter) and, after the compression stages run,
+one line is added to the end of the system prompt asking Gemini to aim for
+under 500 output tokens and to always finish its answer anyway. It works with
+any compression level, e.g. on top of concise guidance with "light" or "full".
+The limit is on the answer only; thinking tokens aren't counted.
+
+A reply that goes over is still sent back whole, with "over_limit": true. Every
+row in the db records soft_output_limit, over_limit (1/0) and over_limit_by
+(how many output tokens over), and the log line for it is a WARNING.
+uv run python db.py summary shows how many replies went over and by how much.
+The limit is part of the cache identity, so an answer written for one limit is
+not reused for another. Cache hits generate nothing new and have no over-limit
+flags.
+
 EXACT-MATCH CACHE (CSC-18)
 
     cache="off"      Default. Skip lookup and storage.
@@ -145,6 +164,7 @@ BENCHMARK WORKLOAD AND CACHE EVALUATION (CSC-22)
     uv run --frozen python -m benchmark run --repeats 1 --no-judge
     uv run --frozen python -m benchmark run --pipelines none light code full --cache-modes off cold warm --repeats 2 --no-judge
     uv run --frozen python -m benchmark run --stages none code code+concise --repeats 1 --no-judge
+    uv run --frozen python -m benchmark run --limits none 512 1024 --repeats 1 --no-judge
 
 --stages and --pipelines select combinations; both accept stage labels and presets.
 

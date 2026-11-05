@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from google import genai
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 import db
 from compressor import pipeline
@@ -30,6 +30,12 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 MODEL = "gemini-3.5-flash"
 model_package = ModelPackage(pricing=None, tokenizer=GeminiTokenCounter(client))
+# soft_output_limit when the client doesn't send one. The limit is an opt-in
+# add-on: off by default, so compression "none" stays an unchanged prompt. When
+# a client sends one, the prompt asks Gemini to aim for that many output tokens
+# (thinking not included). Nothing is cut off, a reply that goes over is only
+# flagged (see _call_gemini).
+DEFAULT_SOFT_OUTPUT_LIMIT = None
 DEFAULT_COMPRESSION = pipeline.validate_pipeline(os.environ.get("COMPRESSION_LEVEL", pipeline.DEFAULT_PIPELINE))
 
 
@@ -61,10 +67,13 @@ def _ms_since(start):
 #   .........
 #   db.insert_request(record) <-- this actually saves to the sqlite
 @app.get("/ask")
-def ask(prompt: str):
+def ask(prompt: str, soft_output_limit: Annotated[int | None, Query(gt=0)] = DEFAULT_SOFT_OUTPUT_LIMIT):
     record = db.RequestRecord(endpoint="/ask", model=MODEL)
     try:
-        text = _answer(record, pipeline.Prompt(prompt), pipeline.resolve_stages(DEFAULT_COMPRESSION))
+        text = _answer(
+            record, pipeline.Prompt(prompt), pipeline.resolve_stages(DEFAULT_COMPRESSION),
+            soft_output_limit=soft_output_limit,
+        )
     except Exception:
         raise _request_error(record) from None
     return {"text": text}
@@ -77,6 +86,9 @@ class AskRequest(BaseModel):
     compression: str | None = None
     stages: list[str] | None = None
     cache: Literal["off", "use", "refresh"] = "off"
+    # reply length in output tokens the model is asked to stay under. Leave it out
+    # (or null) for no limit
+    soft_output_limit: int | None = Field(DEFAULT_SOFT_OUTPUT_LIMIT, gt=0)
 
     @field_validator("compression")
     @classmethod
@@ -122,30 +134,48 @@ def _request_error(record):
 @app.post("/ask")
 def ask_post(body: AskRequest):
     """Like GET /ask, but takes a system prompt and compression stages or a preset, and
-    returns the request_id of the row saved for it (also on failure, in `detail`)."""
+    returns the request_id of the row saved for it (also on failure, in `detail`).
+    `over_limit` says whether the reply went over soft_output_limit."""
     record = db.RequestRecord(endpoint="/ask", model=MODEL)
     try:
-        text = _answer(record, pipeline.Prompt(body.prompt, body.system), body.selected_stages(), body.cache)
+        text = _answer(
+            record, pipeline.Prompt(body.prompt, body.system), body.selected_stages(), body.cache,
+            body.soft_output_limit,
+        )
     except Exception:
         raise _request_error(record) from None
-    return {"text": text, "request_id": record.request_id, "cache_status": record.cache_status}
+    return {
+        "text": text,
+        "request_id": record.request_id,
+        "cache_status": record.cache_status,
+        "over_limit": bool(record.over_limit),
+    }
 
 
-def _answer(record: db.RequestRecord, prompt: pipeline.Prompt, stages=(), cache="off") -> str:
+def _answer(
+    record: db.RequestRecord,
+    prompt: pipeline.Prompt,
+    stages=(),
+    cache="off",
+    soft_output_limit: int | None = DEFAULT_SOFT_OUTPUT_LIMIT,
+) -> str:
     """Compress the prompt, send it to Gemini and return the reply text.
 
-    Fills `record` along the way and saves it at the end, also when something
-    raises (the error is re-raised after that).
+    `soft_output_limit` is the reply length Gemini is asked to aim for (None for
+    no limit), see _call_gemini. Fills `record` along the way and saves it at
+    the end, also when something raises (the error is re-raised after that).
     """
     start = time.perf_counter()
     record.compression = pipeline.label(stages)
     record.compression_version = pipeline.PIPELINE_VERSION
     record.cache_status = "off" if cache == "off" else "disabled"
+    record.soft_output_limit = soft_output_limit
     try:
         key = make_cache_key(
             model=MODEL, prompt=prompt.text, system=prompt.system,
             context=tuple((chunk.text, chunk.source) for chunk in prompt.context),
             compression=record.compression, pipeline_version=pipeline.fingerprint(stages),
+            soft_output_limit=soft_output_limit,
         )
         record.prompt_hash = key
         use_cache = cache != "off" and response_cache.enabled
@@ -181,16 +211,20 @@ def _answer(record: db.RequestRecord, prompt: pipeline.Prompt, stages=(), cache=
 
         prompt = compressor_service.compressed_prompt
         logger.info("Request %s sent to %s (compression=%s)", record.request_id, MODEL, record.compression)
-        kwargs = {"model": MODEL, "input": prompt.render()}
-        if prompt.system is not None:
-            kwargs["system_instruction"] = prompt.system
         upstream_start = time.perf_counter()
         try:
-            interaction = client.interactions.create(**kwargs)
+            text = _call_gemini(record, prompt, soft_output_limit)
         finally:
             record.latency_upstream_ms = _ms_since(upstream_start)
-        fill_from_interaction(record, interaction)  # tokens, status, ids (gemini_parse.py)
-        text = reply_text(interaction)
+        logger.log(
+            logging.WARNING if record.over_limit else logging.INFO,
+            "Reply %s: %s output + %s thought tokens, soft limit %s%s",
+            record.request_id,
+            record.output_tokens,
+            record.thought_tokens,
+            soft_output_limit,
+            f" (OVER by {record.over_limit_by})" if record.over_limit else "",
+        )
         if use_cache and record.status == db.STATUS_OK and text.strip():
             response_cache.put(key, CachedResponse(
                 text=text, input_tokens_raw=record.input_tokens_raw,
@@ -207,6 +241,40 @@ def _answer(record: db.RequestRecord, prompt: pipeline.Prompt, stages=(), cache=
         record.error_message = None
         record.latency_total_ms = _ms_since(start)
         _save(record)
+
+
+def _call_gemini(record, prompt, soft_output_limit):
+    """Send the prompt, asking Gemini to keep the reply under soft_output_limit
+    tokens, and return the reply text.
+
+    There's no hard cap, so a reply is never cut off (cut-off JSON or code would
+    be broken). One that goes over anyway is sent back whole and flagged in the
+    record: over_limit = 1 and over_limit_by = how many output tokens over.
+    """
+    system = prompt.system
+    if soft_output_limit is not None:
+        hint = length_hint(soft_output_limit)
+        system = f"{system}\n\n{hint}" if system else hint
+    kwargs = {"model": MODEL, "input": prompt.render()}
+    if system is not None:
+        kwargs["system_instruction"] = system
+
+    interaction = client.interactions.create(**kwargs)
+    fill_from_interaction(record, interaction)  # tokens, status, ids (gemini_parse.py)
+    if soft_output_limit is not None and record.output_tokens is not None:
+        record.over_limit_by = max(record.output_tokens - soft_output_limit, 0)
+        record.over_limit = int(record.over_limit_by > 0)
+    return reply_text(interaction)
+
+
+def length_hint(soft_output_limit):
+    """The line added to the system prompt that asks for a reply under the limit."""
+    words = soft_output_limit * 3 // 4  # roughly 0.75 English words per token
+    return (
+        f"Aim to keep your answer under {soft_output_limit} tokens (about {words} words). "
+        "This is a guideline, not a hard limit: always finish your answer, and never "
+        "cut code, JSON or other structured output short to stay under it."
+    )
 
 
 def _save(record):

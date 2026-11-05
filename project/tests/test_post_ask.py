@@ -75,7 +75,11 @@ def test_post_ask_returns_text_and_saves_row(monkeypatch, client):
     assert response.status_code == 200
     body = response.json()
     assert body["text"] == "Canberra"
-    assert sent == {"model": "gemini-3.5-flash", "input": "capital?", "system_instruction": "be brief"}
+    assert sent == {
+        "model": "gemini-3.5-flash",
+        "input": "capital?",
+        "system_instruction": "be brief",
+    }
     [row] = db.fetch_requests(request_id=body["request_id"])
     assert row["status"] == db.STATUS_OK
     assert row["compression"] == "none"
@@ -130,6 +134,111 @@ def test_post_ask_runs_the_stages(monkeypatch, client):
     assert row["compression"] == "shout+exclaim"
 
 
+def long_reply(output_tokens):
+    """A good reply that used `output_tokens` output tokens."""
+    reply = ok_reply("a long answer")
+    reply.usage.total_output_tokens = output_tokens
+    return reply
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_soft_limit_is_off_by_default(monkeypatch, client, method):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply("x" * 99))
+
+    if method == "get":
+        client.get("/ask", params={"prompt": "hello"})
+    else:
+        assert client.post("/ask", json={"prompt": "hello"}).json()["over_limit"] is False
+
+    assert "system_instruction" not in sent  # "none" compression sends the prompt untouched
+    assert "generation_config" not in sent  # and there's never a hard cap
+    [row] = db.fetch_requests()
+    assert row["soft_output_limit"] is None and row["over_limit"] is None
+
+
+def test_soft_limit_is_sent_when_the_client_asks(monkeypatch, client):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
+
+    response = client.post("/ask", json={"prompt": "hello", "soft_output_limit": 400})
+
+    assert sent["system_instruction"] == main.length_hint(400)
+    [row] = db.fetch_requests(request_id=response.json()["request_id"])
+    assert row["soft_output_limit"] == 400
+
+
+def test_soft_limit_goes_after_the_clients_system_prompt(monkeypatch, client):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
+
+    client.post("/ask", json={"prompt": "hello", "system": "be nice", "soft_output_limit": 300})
+
+    assert sent["system_instruction"] == "be nice\n\n" + main.length_hint(300)
+    assert "300 tokens" in main.length_hint(300) and "225 words" in main.length_hint(300)
+
+
+def test_null_soft_limit_adds_nothing(monkeypatch, client):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
+
+    response = client.post("/ask", json={"prompt": "hello", "soft_output_limit": None})
+
+    assert "system_instruction" not in sent
+    [row] = db.fetch_requests(request_id=response.json()["request_id"])
+    assert row["soft_output_limit"] is None
+    assert row["over_limit"] is None and row["over_limit_by"] is None
+
+
+@pytest.mark.parametrize("limit", [0, -5])
+def test_post_ask_rejects_a_limit_below_one(client, limit):
+    assert client.post("/ask", json={"prompt": "hello", "soft_output_limit": limit}).status_code == 422
+
+
+def test_get_ask_takes_a_soft_limit(monkeypatch, client):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
+
+    client.get("/ask", params={"prompt": "hello", "soft_output_limit": 50})
+
+    assert sent["system_instruction"] == main.length_hint(50)
+
+
+def test_reply_under_the_limit_is_not_flagged(monkeypatch, client):
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: long_reply(100))
+
+    response = client.post("/ask", json={"prompt": "essay", "soft_output_limit": 100})
+
+    assert response.json()["over_limit"] is False
+    [row] = db.fetch_requests(request_id=response.json()["request_id"])
+    assert row["over_limit"] == 0 and row["over_limit_by"] == 0
+
+
+def test_reply_over_the_limit_is_sent_back_whole_and_flagged(monkeypatch, client):
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: long_reply(250))
+
+    response = client.post("/ask", json={"prompt": "essay", "soft_output_limit": 100})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["text"] == "a long answer" and body["over_limit"] is True
+    [row] = db.fetch_requests(request_id=body["request_id"])
+    assert row["status"] == db.STATUS_OK
+    assert row["over_limit"] == 1 and row["over_limit_by"] == 150
+    assert row["output_tokens"] == 250
+
+
+def test_no_output_count_means_no_flag(monkeypatch, client):
+    reply = ok_reply()
+    reply.usage = None
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: reply)
+
+    response = client.post("/ask", json={"prompt": "hello", "soft_output_limit": 100})
+
+    [row] = db.fetch_requests(request_id=response.json()["request_id"])
+    assert row["over_limit"] is None
+
+
 def test_unknown_stage_raises():
     with pytest.raises(ValueError):
         pipeline.compress(pipeline.Prompt("hi"), ["nope"])
@@ -169,6 +278,33 @@ def test_equivalent_preset_and_stage_list_share_cache(monkeypatch, client):
     assert repeated.json()["cache_status"] == "hit"
     assert len(calls) == 1
     assert all(row["compression"] == "code+concise" for row in db.fetch_requests())
+
+
+def test_soft_limit_is_part_of_cache_identity(monkeypatch, client):
+    from response_cache import ResponseCache
+
+    monkeypatch.setattr(main, "response_cache", ResponseCache())
+    calls = []
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: calls.append(kw) or long_reply(150))
+    first = client.post("/ask", json={"prompt": "hi", "cache": "use", "soft_output_limit": 100})
+    other_limit = client.post("/ask", json={"prompt": "hi", "cache": "use", "soft_output_limit": 500})
+    same_limit = client.post("/ask", json={"prompt": "hi", "cache": "use", "soft_output_limit": 100})
+
+    assert [r.json()["cache_status"] for r in (first, other_limit, same_limit)] == ["miss", "miss", "hit"]
+    assert len(calls) == 2
+    # a hit generates nothing new, so it isn't flagged as going over
+    assert first.json()["over_limit"] is True and same_limit.json()["over_limit"] is False
+    hit_row = db.fetch_requests(request_id=same_limit.json()["request_id"])[0]
+    assert hit_row["over_limit"] is None and hit_row["soft_output_limit"] == 100
+
+
+def test_soft_limit_goes_after_the_concise_instruction(monkeypatch, client):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
+
+    client.post("/ask", json={"prompt": "hi", "compression": "light", "system": "be nice", "soft_output_limit": 200})
+
+    assert sent["system_instruction"] == f"{pipeline.CONCISE_INSTRUCTION}\n\nbe nice\n\n{main.length_hint(200)}"
 
 
 def test_context_is_sent_counted_and_included_in_cache_identity(monkeypatch):

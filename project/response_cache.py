@@ -23,16 +23,19 @@ def make_cache_key(
     compression: str,
     pipeline_version: str,
     context: tuple[tuple[str, str], ...] = (),
+    soft_output_limit: int | None = None,
 ) -> str:
     """Hash the complete request identity, without normalizing any text.
 
     ``pipeline_version`` must identify the effective stages and their settings.
     Bump it when transformation behavior changes. If generation options are
     added to the API later, include those options in this identity too.
+    ``soft_output_limit`` is one: it changes the instruction Gemini gets, so an
+    answer written for one limit isn't reused for another.
     """
     # Keep chunk boundaries and source labels: equal rendered text can pass
     # through code stages differently when fences span separate chunks.
-    identity = ["exact-response-v1", model, prompt, system, context, compression, pipeline_version]
+    identity = ["exact-response-v1", model, prompt, system, context, compression, pipeline_version, soft_output_limit]
     encoded = json.dumps(identity, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

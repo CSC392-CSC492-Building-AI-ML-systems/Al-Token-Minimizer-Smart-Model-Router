@@ -4,6 +4,7 @@ From the project folder:
     uv run python -m benchmark run                      # baseline: every test 3 times, no stages ("none")
     uv run python -m benchmark run --stages none code code+concise --repeats 5
     uv run python -m benchmark run --tests orders_json verbose_json --repeats 1
+    uv run python -m benchmark run --limits none 512 1024    # compare soft output limits against no limit
     uv run python -m benchmark grade benchmark/results/<run>   # re-grade (e.g. after changing a check)
     uv run python -m benchmark report benchmark/results/<run>  # rebuild the report
     uv run python -m benchmark list                     # show the tests and their sizes
@@ -21,7 +22,10 @@ take the same path as real traffic, compression and telemetry included,
 without needing the server running. A "pipeline" here is an ordered combination
 of stages, written as a label such as "none", "code" or "code+concise", or a
 preset such as "light" or "full". Replies are graded in memory and are only
-saved when --save-replies is explicitly set. Each repeat runs every (test, pipeline)
+saved when --save-replies is explicitly set. With --limits a pipeline also has
+a soft output limit, e.g. "none limit=1024" (soft_output_limit 1024) or
+"none limit=none" (no limit); without it every call gets the server's default
+limit and pipelines are named by their stages alone. Each repeat runs every (test, pipeline)
 pair in a shuffled order, so pipelines are compared under the same Gemini load
 instead of one after the other.
 """
@@ -47,6 +51,8 @@ from compressor import pipeline as compression
 RESULTS_DIR = Path(__file__).parent / "results"
 BASELINE = "none"  # the baseline must not change if the server default changes
 CACHE_MODES = {"off": "off", "cold": "refresh", "warm": "use"}
+DEFAULT_LIMIT = "default"  # --limits value that leaves soft_output_limit to the server
+NO_LIMIT = "none"  # --limits value that sends soft_output_limit: null
 
 # Copied from the request's db row into results.jsonl.
 ROW_COLUMNS = (
@@ -66,6 +72,9 @@ ROW_COLUMNS = (
     "latency_compress_ms",
     "latency_count_ms",
     "cache_status",
+    "soft_output_limit",
+    "over_limit",
+    "over_limit_by",
 )
 RETRY_HTTP = {429, 500, 503}  # rate limited or overloaded ("high demand"): wait and try again
 RETRY_STATUSES = {"timeout", "connection_error"}
@@ -90,6 +99,13 @@ def run(args):
         sys.exit("pipeline and test names must be nonempty and unique")
     if not 0 <= args.threshold <= 1:
         sys.exit("threshold must be between 0 and 1")
+    limits = getattr(args, "limits", [DEFAULT_LIMIT])
+    if not limits or len(limits) != len(set(limits)):
+        sys.exit("limits must be nonempty and unique")
+    # one pipeline per (stages, limit) pair, so the rest of the runner only sees names
+    baseline_limit = NO_LIMIT if NO_LIMIT in limits else limits[0]
+    args.baseline = _variant_name(BASELINE, baseline_limit, limits)
+    args.pipelines = [_variant_name(name, limit, limits) for name in args.pipelines for limit in limits]
 
     out = RESULTS_DIR / datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S_%fZ")
     out.mkdir(parents=True, exist_ok=False)
@@ -140,7 +156,10 @@ def _run_calls(out, args, modes, db, main, client):
         "model": main.MODEL,
         "pipelines": args.pipelines,
         "pipeline_version": compression.PIPELINE_VERSION,
-        "pipeline_fingerprints": {name: compression.fingerprint(name) for name in args.pipelines},
+        "pipeline_fingerprints": {name: compression.fingerprint(_split(name)[0]) for name in args.pipelines},
+        "baseline": args.baseline,
+        "limits": getattr(args, "limits", [DEFAULT_LIMIT]),
+        "default_soft_output_limit": main.DEFAULT_SOFT_OUTPUT_LIMIT,
         "tests": args.tests,
         "repeats": args.repeats,
         "seed": args.seed,
@@ -175,7 +194,9 @@ def _run_calls(out, args, modes, db, main, client):
                 previous_mode = mode
             # Presets and explicit labels resolving to the same stage order
             # share server cache identity, even when reported under two labels.
-            identity = (case.prompt, case.system, tuple(compression.resolve_stages(name)))
+            # The soft limit is part of it too (see response_cache.make_cache_key).
+            stages, limit = _split(name)
+            identity = (case.prompt, case.system, tuple(compression.resolve_stages(stages)), limit)
             expected_hit = mode == "warm" and identity in seen and main.response_cache.enabled
             row = _call(client, db, case, name, args, cache_mode=mode)
             row.update(
@@ -218,11 +239,27 @@ def _run_calls(out, args, modes, db, main, client):
     _write_json(out / "meta.json", meta)
 
 
+def _variant_name(stages, limit, limits):
+    """How a (stages, limit) pair is shown: just the stages when only the default limit is run."""
+    return stages if limits == [DEFAULT_LIMIT] else f"{stages} limit={limit}"
+
+
+def _split(name):
+    """The reverse of _variant_name: "code limit=512" -> ("code", 512), "none" -> ("none", "default")."""
+    stages, _, limit = name.partition(" limit=")
+    if not limit:
+        return stages, DEFAULT_LIMIT
+    return stages, limit if limit in (DEFAULT_LIMIT, NO_LIMIT) else int(limit)
+
+
 def _call(client, db, case, pipeline_name, args, cache_mode="off"):
     """POST the case to /ask, retrying rate limits and timeouts. Returns the results.jsonl fields."""
+    stages, limit = _split(pipeline_name)
     body = {"prompt": case.prompt, "system": case.system,
-            "stages": list(compression.resolve_stages(pipeline_name)),
+            "stages": list(compression.resolve_stages(stages)),
             "cache": CACHE_MODES[cache_mode]}
+    if limit != DEFAULT_LIMIT:
+        body["soft_output_limit"] = None if limit == NO_LIMIT else limit
     attempts = []
     started = time.perf_counter()
     for attempt in range(1, args.retries + 2):
@@ -376,12 +413,29 @@ def report(out):
                     f"| {s['unknown_usage_attempts']} | {s['unexpected_cache_hits']} | {s['cache_reply_mismatches']} |"
                 )
 
-    compared = [p for p in pipelines if p != BASELINE]
+    lines += [
+        "", "## Soft output limit", "",
+        "Replies that went over the output tokens their prompt asked them to stay under. Nothing is cut off, "
+        "so these are complete replies. Cache hits generate nothing new and aren't counted.", "",
+        "| pipeline | cache | limited replies | over limit | over rate | avg over by | max over by |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for name in pipelines:
+        for mode in modes:
+            s = stats.get(("ALL", name, mode))
+            if s:
+                lines.append(
+                    f"| {name} | {mode} | {s['limited_replies']} | {s['over_limit']} | {_pct(s['over_rate'])} "
+                    f"| {_num(s['avg_over_by'])} | {_num(s['max_over_by'])} |"
+                )
+
+    baseline = meta.get("baseline", BASELINE)  # runs from before --limits don't have it
+    compared = [p for p in pipelines if p != baseline]
     deltas = {}
-    if BASELINE in pipelines and compared:
+    if baseline in pipelines and compared:
         lines += [
             "",
-            f"## Change vs `{BASELINE}`",
+            f"## Change vs `{baseline}`",
             "",
             "Compared within the same cache phase. Token savings on warm phases include response reuse.",
             "", "| test | pipeline | cache | input tok | output tok | total tok | request avg | pass rate |",
@@ -389,7 +443,7 @@ def report(out):
         ]
         for test in tests:
             for mode in modes:
-                base = stats.get((test, BASELINE, mode))
+                base = stats.get((test, baseline, mode))
                 for name in compared:
                     s = stats.get((test, name, mode))
                     if base is None or s is None:
@@ -456,6 +510,8 @@ def report(out):
 def _stats(rows):
     ok = [r for r in rows if r["status"] == "ok"]
     passed = [r for r in ok if r["passed"]]
+    limited = [r for r in ok if r.get("over_limit") is not None]  # .get: runs from before the soft limit
+    over_by = [r["over_limit_by"] for r in limited if r["over_limit"]]
 
     def values(column):
         return [r[column] for r in ok if r.get(column) is not None]
@@ -473,6 +529,11 @@ def _stats(rows):
         "cache_hit_rate": sum(r.get("cache_status") == "hit" for r in rows) / len(rows) if rows else None,
         "unexpected_cache_hits": sum(r.get("cache_status") == "hit" and not r.get("cache_expected_hit") for r in rows),
         "cache_reply_mismatches": sum(r.get("cache_reply_matches") is False for r in rows),
+        "limited_replies": len(limited),
+        "over_limit": len(over_by),
+        "over_rate": len(over_by) / len(limited) if limited else None,
+        "avg_over_by": statistics.fmean(over_by) if over_by else None,
+        "max_over_by": max(over_by, default=None),
         "input_tokens_raw": mean("input_tokens_raw"),
         "input_tokens_compressed": mean("input_tokens_compressed"),
         "input_tokens": mean("input_tokens_reported"),
@@ -562,6 +623,14 @@ def list_tests():
         print(f"{case.name:<26} {case.category:<22} {size:>7,} chars  judge={case.judge}  expected {case.expected[:60]}")
 
 
+def _limit(text):
+    if text in (DEFAULT_LIMIT, NO_LIMIT):
+        return text
+    if not text.isdigit() or int(text) == 0:
+        raise argparse.ArgumentTypeError(f"expected a positive number, {NO_LIMIT} or {DEFAULT_LIMIT}, got {text!r}")
+    return int(text)
+
+
 def cli(argv=None):
     parser = argparse.ArgumentParser(prog="python -m benchmark", description="Compression benchmark.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -582,6 +651,10 @@ def cli(argv=None):
     run_parser.add_argument("--cache-modes", nargs="+", choices=list(CACHE_MODES), default=["off"],
                             help="cache phases: off bypasses caching, cold refreshes every request, "
                                  "warm starts empty then reuses exact repeats (default off)")
+    run_parser.add_argument("--limits", nargs="+", type=_limit, default=[DEFAULT_LIMIT],
+                            help=f"soft output limits to compare: numbers, {NO_LIMIT} for no limit or "
+                                 f"{DEFAULT_LIMIT} for the server's (default: {DEFAULT_LIMIT}); "
+                                 f"{NO_LIMIT} is the baseline if listed")
     run_parser.add_argument("--save-replies", action="store_true",
                             help="explicitly save response text to enable later regrading; omitted by default")
     run_parser.add_argument("--repeats", type=int, default=3, help="times each test is sent per combination (default 3)")

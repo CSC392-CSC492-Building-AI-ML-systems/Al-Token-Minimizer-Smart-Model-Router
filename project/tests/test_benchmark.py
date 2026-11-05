@@ -20,6 +20,10 @@ import main  # noqa: E402
 from benchmark import cases, run  # noqa: E402
 from tests.test_post_ask import RateLimited, ok_reply  # noqa: E402
 
+# a call can also get a system prompt from the soft limit's hint, so the fakes
+# spot verbose_json by its own one
+VERBOSE_JSON_SYSTEM = cases.TESTS["verbose_json"].system
+
 
 @pytest.fixture(autouse=True)
 def temp_db(monkeypatch, tmp_path):
@@ -126,6 +130,7 @@ def run_args(tmp_path, **overrides):
         tests=["control_short", "verbose_json"],
         repeats=2,
         pipelines=["none"],
+        limits=["default"],
         seed=0,
         delay=0,
         retries=1,
@@ -140,7 +145,7 @@ def run_args(tmp_path, **overrides):
 
 def test_run_grades_and_reports(monkeypatch, tmp_path):
     def fake_create(model, input, system_instruction=None):
-        if system_instruction:  # verbose_json
+        if VERBOSE_JSON_SYSTEM in (system_instruction or ""):  # verbose_json
             return ok_reply('{"answer": "Canberra", "confidence": 0.9}')
         return ok_reply("72°F is 22.2°C")
 
@@ -157,6 +162,38 @@ def test_run_grades_and_reports(monkeypatch, tmp_path):
     assert stats["ALL/none"]["pass_rate"] == 1
     assert stats["ALL/none"]["input_tokens"] == 12
     assert "| control_short | none |" in (out / "report.md").read_text(encoding="utf-8")
+
+
+def test_run_compares_limits_against_no_limit(monkeypatch, tmp_path):
+    hints_sent = []
+
+    def fake_create(model, input, system_instruction=None):
+        hints_sent.append(system_instruction)
+        reply = ok_reply("72°F is 22.2°C")
+        reply.usage.total_output_tokens = 2  # over a limit of 1
+        return reply
+
+    monkeypatch.setattr(main.client.interactions, "create", fake_create)
+
+    out = run.run(run_args(tmp_path, tests=["control_short"], repeats=1, limits=[1, "none"]))
+
+    assert sorted(hints_sent, key=str) == [main.length_hint(1), None]
+    meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+    assert meta["pipelines"] == ["none limit=1", "none limit=none"]
+    assert meta["baseline"] == "none limit=none"
+    report_json = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert "control_short/none limit=1" in report_json["change_vs_baseline"]
+    assert report_json["stats"]["ALL/none limit=1"]["over_limit"] == 1
+    assert report_json["stats"]["ALL/none limit=1"]["avg_over_by"] == 1
+    assert report_json["stats"]["ALL/none limit=none"]["over_limit"] == 0
+    assert "## Change vs `none limit=none`" in (out / "report.md").read_text(encoding="utf-8")
+
+
+def test_limit_argument():
+    assert run._limit("none") == "none" and run._limit("default") == "default" and run._limit("256") == 256
+    for bad in ("0", "-3", "lots"):
+        with pytest.raises(Exception):
+            run._limit(bad)
 
 
 def test_run_retries_rate_limits(monkeypatch, tmp_path):
@@ -180,7 +217,7 @@ def test_run_retries_rate_limits(monkeypatch, tmp_path):
 
 def test_jev_only_asked_about_failed_judgeable_checks(monkeypatch, tmp_path):
     def fake_create(model, input, system_instruction=None):
-        if system_instruction:
+        if VERBOSE_JSON_SYSTEM in (system_instruction or ""):
             return ok_reply("Canberra")  # fails verbose_json, which Jev must not overrule
         return ok_reply("twenty-two point two degrees")  # fails the number check
 
