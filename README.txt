@@ -44,3 +44,19 @@ uv run python -m benchmark run --stages none a a+b         (compare no stages, s
 
 results go in benchmark/results/<time>/report.md. --help for all options.
 For reading the .md file VS code should be able to render the table in markdown if you righclick on the file and click Open preview 
+
+SEMANTIC CACHE
+
+/ask answers a question that means the same as an earlier one from a cache in
+Redis, without calling Gemini. Start Redis first, from the project folder:
+
+docker compose up -d
+
+(without it the server still works, just without the cache.) To see what's in
+the cache:
+
+uv run python -m cache.semantic list                       (every entry, newest first)
+uv run python -m cache.semantic check "your question"      (closest entries and how close they are)
+uv run python -m cache.semantic clear                      (delete everything, asks first)
+
+the hit rate is in uv run python db.py summary. send "cache": false to POST /ask to skip it.

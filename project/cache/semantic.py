@@ -12,19 +12,31 @@ compression, so changing the stages doesn't make every lookup miss.
 
 Needs Redis Stack running (docker compose up -d in this folder). REDIS_URL in
 .env points somewhere else; the default is redis://localhost:6379.
+
+To see what's in the cache, from the project folder:
+    uv run python -m cache.semantic list              # newest entries first
+    uv run python -m cache.semantic check "question"  # closest entries and their distance
+    uv run python -m cache.semantic clear             # delete every entry (asks first)
 """
 
+import argparse
 import hashlib
 import os
+import time
 
 from compressor.pipeline import Prompt
 
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 DISTANCE_THRESHOLD = 0.1  # cosine distance, about similarity 0.9 and up; tune with the benchmark
 TTL_SECONDS = 7 * 24 * 60 * 60  # entries expire after a week
+CACHE_NAME = "semantic_cache"  # Redis index name, and the prefix of every key
 
 _cache = None
 _vectorizer = None  # kept apart from _cache, so a failed Redis connection doesn't reload the model
+
+
+def _redis_url():
+    return os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 
 def _get_vectorizer():
@@ -45,8 +57,8 @@ def _get_cache():
         from redisvl.extensions.cache.llm import SemanticCache
 
         _cache = SemanticCache(
-            name="semantic_cache",
-            redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379"),
+            name=CACHE_NAME,
+            redis_url=_redis_url(),
             distance_threshold=DISTANCE_THRESHOLD,
             ttl=TTL_SECONDS,
             vectorizer=_get_vectorizer(),
@@ -90,3 +102,110 @@ def store(prompt: Prompt, model: str, answer: str) -> None:
         response=answer,
         filters={"scope": _scope(prompt, model)},
     )
+
+
+# ---------------------------------------------------------------- command line
+
+
+def _short(text, width):
+    text = " ".join(str(text).split())
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _ago(seconds):
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds // size:.0f}{unit}"
+    return f"{seconds:.0f}s"
+
+
+def list_entries(limit=None):
+    """Every entry as a dict (prompt, response, scope, inserted_at, ttl, key), newest first.
+    Reads Redis directly, so it doesn't load the embedding model."""
+    import redis
+
+    client = redis.Redis.from_url(_redis_url(), decode_responses=True)
+    entries = []
+    for key in client.scan_iter(f"{CACHE_NAME}:*"):
+        prompt, response, scope, inserted_at = client.hmget(key, "prompt", "response", "scope", "inserted_at")
+        if prompt is None:  # not a cache entry
+            continue
+        entries.append({
+            "key": key,
+            "prompt": prompt,
+            "response": response,
+            "scope": scope,
+            "inserted_at": float(inserted_at or 0),
+            "ttl": client.ttl(key),
+        })
+    entries.sort(key=lambda entry: entry["inserted_at"], reverse=True)
+    return entries[:limit]
+
+
+def _cli_list(args):
+    entries = list_entries(args.limit)
+    if not entries:
+        print("The cache is empty.")
+        return
+    now = time.time()
+    print(f"{'age':>5} {'expires':>8}  {'scope':<8}  {'prompt':<50}  response")
+    for entry in entries:
+        expires = _ago(entry["ttl"]) if entry["ttl"] >= 0 else "never"
+        print(
+            f"{_ago(now - entry['inserted_at']):>5} {expires:>8}  {(entry['scope'] or '')[:8]:<8}  "
+            f"{_short(entry['prompt'], 50):<50}  {_short(entry['response'], 60)}"
+        )
+    print(f"\n{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} shown. Same scope = same model, system prompt and chunks.")
+
+
+def _cli_check(args):
+    question = " ".join(args.question.split())
+    hits = _get_cache().check(prompt=question, num_results=args.limit, distance_threshold=2.0)
+    if not hits:
+        print("The cache is empty.")
+        return
+    print(f"Closest entries to {question!r} (a hit needs distance <= {DISTANCE_THRESHOLD} and the same scope):\n")
+    print(f"{'distance':>8}  {'':<6}  {'scope':<8}  {'prompt':<50}  response")
+    for hit in hits:
+        distance = float(hit["vector_distance"])
+        mark = "close" if distance <= DISTANCE_THRESHOLD else ""
+        print(
+            f"{distance:>8.3f}  {mark:<6}  {hit.get('scope', '')[:8]:<8}  "
+            f"{_short(hit['prompt'], 50):<50}  {_short(hit['response'], 60)}"
+        )
+
+
+def _cli_clear(args):
+    count = len(list_entries())
+    if not count:
+        print("The cache is already empty.")
+        return
+    if not args.yes and input(f"Delete all {count} cache entries? [y/N] ").strip().lower() != "y":
+        print("Nothing deleted.")
+        return
+    _get_cache().clear()
+    print(f"Deleted {count} entries.")
+
+
+def cli(argv=None):
+    parser = argparse.ArgumentParser(description="Look at or empty the semantic cache in Redis.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    list_parser = commands.add_parser("list", help="show the cached entries, newest first")
+    list_parser.add_argument("--limit", type=int, help="show at most this many")
+    list_parser.set_defaults(run=_cli_list)
+    check_parser = commands.add_parser("check", help="show the entries closest in meaning to a question")
+    check_parser.add_argument("question")
+    check_parser.add_argument("--limit", type=int, default=5, help="how many to show (default 5)")
+    check_parser.set_defaults(run=_cli_check)
+    clear_parser = commands.add_parser("clear", help="delete every entry")
+    clear_parser.add_argument("--yes", action="store_true", help="don't ask first")
+    clear_parser.set_defaults(run=_cli_clear)
+    args = parser.parse_args(argv)
+    args.run(args)
+
+
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+
+    load_dotenv()  # REDIS_URL and HF_HUB_OFFLINE from .env
+    cli()

@@ -7,8 +7,9 @@ services:
     volumes:
       - redis-data:/data
     environment:
-      # Redis keeps its data under 3 GB, dropping the least recently used entries
-      - REDIS_ARGS=--maxmemory 3gb --maxmemory-policy allkeys-lru
+      # Redis keeps its data under 3 GB, dropping the least recently used entries,
+      # and writes every change to disk (appendonly) so the cache survives restarts
+      - REDIS_ARGS=--maxmemory 3gb --maxmemory-policy allkeys-lru --appendonly yes
     mem_limit: 4g  # hard cap for the whole container, with room for Redis's own overhead
     restart: unless-stopped
 
