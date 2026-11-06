@@ -169,6 +169,7 @@ def ask_post(body: AskRequest):
         "text": text,
         "request_id": record.request_id,
         "cache_status": record.cache_status,
+        "cache_hit": record.cache_hit,  # which cache answered: "exact", "semantic", or None
         "over_limit": bool(record.over_limit),
     }
 

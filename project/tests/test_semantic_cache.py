@@ -74,6 +74,7 @@ def test_a_hit_answers_without_calling_gemini(monkeypatch, client, stored):
     assert response.status_code == 200
     assert response.json()["text"] == "from cache"
     assert response.json()["cache_status"] == "hit"
+    assert response.json()["cache_hit"] == "semantic"
     [row] = db.fetch_requests(request_id=response.json()["request_id"])
     assert row["cache_status"] == "hit"
     assert row["cache_hit"] == "semantic"
@@ -102,6 +103,7 @@ def test_an_exact_hit_skips_the_semantic_cache(monkeypatch, client, stored):
 
     response = client.post("/ask", json={"prompt": "hello", "cache": "use"})
 
+    assert response.json()["cache_hit"] == "exact"
     [row] = db.fetch_requests(request_id=response.json()["request_id"])
     assert row["cache_hit"] == "exact"
     assert row["latency_cache_ms"] is None
