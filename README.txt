@@ -1,7 +1,8 @@
 AI TOKEN MINIMIZER / COMPRESSION PROXY
 
-This project reduces model usage in three ways: compact code in input prompts,
-encourage concise complete answers, and reuse exact answers when requested.
+This project reduces model usage in four ways: compact code in input prompts,
+encourage concise complete answers, reuse exact answers when requested, and
+reuse answers to questions that mean the same (semantic cache, needs Redis).
 It currently proxies one Gemini model, gemini-3.5-flash. Model selection/routing
 and verified dollar pricing are not implemented yet.
 
@@ -10,7 +11,11 @@ From the project folder, install dependencies and start the server:
     uv sync --locked
     cp .env.example .env
     # Put your Gemini API key in .env, which is gitignored.
+    docker compose up -d     # Redis for the semantic cache, see REDIS (DOCKER) below
     uv run --frozen fastapi dev
+
+Redis is optional: without it the server still works, just without the
+semantic cache (startup logs "Semantic cache not ready").
 
 Interactive API documentation: http://127.0.0.1:8000/docs
 If a machine's uv configuration redirects PyPI, use UV_NO_CONFIG=1 and
@@ -19,7 +24,8 @@ If a machine's uv configuration redirects PyPI, use UV_NO_CONFIG=1 and
 HOW THE CODE FITS TOGETHER
 
     ask.py / HTTP caller
-      -> main.py: validate request, check optional exact-match cache
+      -> main.py: validate request, check optional exact-match cache,
+         then the semantic cache (cache/semantic.py, Redis)
       -> compressor/pipeline.py: ordered stages selected directly or by preset
       -> compressor/compressor_service.py: count original and transformed input
       -> Gemini interactions.create
@@ -141,6 +147,69 @@ newly consumed provider tokens and upstream cost are zero. cache_status is one
 of off, disabled, miss, hit, refresh. Gemini's cached_tokens describes provider
 prompt caching and is separate from this response cache.
 
+SEMANTIC CACHE
+
+With cache="use", an exact miss then looks for an earlier question that means
+the same (bge-small embeddings, stored in Redis) and returns its answer without
+calling Gemini. The same model, system prompt, chunks, stages and soft output
+limit are needed for a hit; only the question is compared by meaning.
+cache="refresh" skips the lookup and stores the new answer, cache="off" skips
+both. Hits have cache_status hit and cache_hit "semantic" (exact hits: "exact").
+
+Settings in .env:
+
+    CACHE_ENABLED=false                     turns off both caches
+    EXACT_CACHE_ENABLED=false               turns off only the exact cache
+    SEMANTIC_CACHE_ENABLED=false            turns off only the semantic cache
+    SEMANTIC_CACHE_TTL_SECONDS=18000        how long entries last (default 5 hours)
+    SEMANTIC_CACHE_DISTANCE_THRESHOLD=0.1   how close in meaning for a hit: 0 is the
+                                            same meaning only, higher is looser
+
+Redis has to be running, see REDIS (DOCKER) below. To see what's in the cache:
+
+    uv run python -m cache.semantic list                       (every entry, newest first)
+    uv run python -m cache.semantic check "your question"      (closest entries and how close they are)
+    uv run python -m cache.semantic clear                      (delete everything, asks first)
+
+Redis keeps everything in memory only, nothing is written to disk. Restarting
+the server keeps the cache (Redis runs separately); restarting the Redis
+container or the computer empties it.
+
+REDIS (DOCKER)
+
+The semantic cache stores its entries in Redis Stack (Redis plus vector
+search), run in Docker. docker-compose.yml in the project folder sets it up:
+port 6379, at most 3 GB of entries (least recently used are dropped first),
+a 4 GB limit for the container, memory only (nothing written to disk), and it
+restarts with Docker unless you stop it.
+
+One-time setup:
+
+    1. Install Docker Desktop (https://www.docker.com/products/docker-desktop/)
+       and open it. It has to be running for any docker command to work.
+    2. From the project folder:
+           docker compose up -d
+       The first time this downloads the redis/redis-stack-server image.
+    3. Check it's up:
+           docker ps                                   (redis-cache should be listed)
+           docker exec redis-cache redis-cli ping      (should print PONG)
+
+The embedding model (BAAI/bge-small-en-v1.5, about 130 MB) downloads from
+Hugging Face the first time the server starts. After that you can add
+HF_HUB_OFFLINE=1 to .env so it never checks online again.
+
+Day to day, from the project folder:
+
+    docker compose up -d                      start Redis (if Docker restarted, it usually already is)
+    docker compose stop                       stop it, the cache is emptied
+    docker compose up -d --force-recreate     apply changes to docker-compose.yml
+    docker compose logs -f redis              watch Redis's log
+    docker exec -it redis-cache redis-cli     a Redis prompt, e.g. DBSIZE, KEYS semantic_cache:*
+
+The server doesn't start Docker or Redis itself, start them before it. Redis
+Insight (a desktop app) can also browse the data: connect to localhost:6379.
+REDIS_URL in .env points the server at a different Redis.
+
 TELEMETRY AND PRIVACY
 
     uv run --frozen python db.py summary
@@ -156,7 +225,8 @@ New /ask rows and application logs do not store raw prompts or answers. Telemetr
 stores a request digest, counts, timings, status, HTTP code, and error type.
 Free-form error messages are omitted because providers can echo request/response
 content in them. Old log/database content is not rewritten. Answers are retained
-only in the opt-in memory cache unless benchmark --save-replies is explicitly used.
+only in the opt-in caches, in memory (and Redis's memory for the semantic one) unless
+benchmark --save-replies is explicitly used.
 
 BENCHMARK WORKLOAD AND CACHE EVALUATION (CSC-22)
 

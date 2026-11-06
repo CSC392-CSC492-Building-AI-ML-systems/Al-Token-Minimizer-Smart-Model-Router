@@ -49,6 +49,7 @@ COLUMNS = {
     "compression": "TEXT",  # ordered stage label, e.g. "code+concise" or "none"
     "compression_version": "TEXT",
     "cache_status": "TEXT CHECK (cache_status IN ('off', 'disabled', 'miss', 'hit', 'refresh'))",
+    "cache_hit": "TEXT",  # which cache answered on a hit, "exact" or "semantic", else NULL
     # tokens
     "input_tokens_raw": "INTEGER",  # our count before compression
     "input_tokens_compressed": "INTEGER",  # same as raw until compression exists
@@ -66,6 +67,7 @@ COLUMNS = {
     "latency_upstream_ms": "REAL",
     "latency_count_ms": "REAL",
     "latency_compress_ms": "REAL",  # time spent in the compression pipeline
+    "latency_cache_ms": "REAL",  # time spent looking up the semantic cache
     # outcome
     "status": "TEXT NOT NULL CHECK (status IN (%s))"
     % ", ".join(f"'{s}'" for s in STATUSES),
@@ -91,6 +93,7 @@ LATENCY_COLUMNS = {
     "upstream": "latency_upstream_ms",
     "count": "latency_count_ms",
     "compress": "latency_compress_ms",
+    "cache": "latency_cache_ms",
 }
 
 SCHEMA = (
@@ -117,6 +120,7 @@ class RequestRecord:
     compression: str | None = None
     compression_version: str | None = None
     cache_status: str | None = None
+    cache_hit: str | None = None
     # tokens
     input_tokens_raw: int | None = None
     input_tokens_compressed: int | None = None
@@ -134,6 +138,7 @@ class RequestRecord:
     latency_upstream_ms: float | None = None
     latency_count_ms: float | None = None
     latency_compress_ms: float | None = None
+    latency_cache_ms: float | None = None
     # outcome
     status: str | None = None
     http_status: int | None = None
@@ -288,7 +293,7 @@ def summarize_requests(db_path=None, model=None, status=None, since=None, until=
     """
     where, params = _where_clause(model=model, status=status, since=since, until=until)
     columns = [
-        "model", "timestamp", "status", "cost_usd", "cache_status", "over_limit", "over_limit_by",
+        "model", "timestamp", "status", "cost_usd", "cache_status", "cache_hit", "over_limit", "over_limit_by",
         *TOKEN_COLUMNS, *LATENCY_COLUMNS.values(),
     ]
     sql = f"SELECT {', '.join(columns)} FROM requests{where}"
@@ -324,6 +329,7 @@ class _Totals:
         self.limited_replies = 0  # rows with a soft output limit and an output count
         self.over_by = []  # over_limit_by of the rows that went over
         self.latencies = {name: [] for name in LATENCY_COLUMNS}
+        self.cache_hits_by = {"exact": 0, "semantic": 0}  # hits, by which cache answered
 
     def add(self, row):
         self.requests += 1
@@ -355,6 +361,9 @@ class _Totals:
             if row[column] is not None:
                 self.latencies[name].append(row[column])
 
+        if row["cache_hit"] in self.cache_hits_by:
+            self.cache_hits_by[row["cache_hit"]] += 1
+
     def summary(self):
         return {
             "requests": self.requests,
@@ -370,6 +379,7 @@ class _Totals:
             "cache": {
                 "status_counts": dict(self.cache_counts),
                 "hit_rate": _ratio(self.cache_counts["hit"], self.cache_counts["hit"] + self.cache_counts["miss"]),
+                "hits_by_cache": dict(self.cache_hits_by),
             },
             "cost_usd": {
                 "total": self.cost,
@@ -437,7 +447,8 @@ def format_summary(summary):
         f"compression   {_fmt_num(compression['tokens_saved'])} input tokens saved "
         f"({_fmt_pct(compression['saved_rate'])})",
         f"cache         {summary['cache']['status_counts']['hit']:,} hits "
-        f"({_fmt_pct(summary['cache']['hit_rate'])} of lookups)",
+        f"({_fmt_pct(summary['cache']['hit_rate'])} of lookups; "
+        f"{summary['cache']['hits_by_cache']['exact']:,} exact, {summary['cache']['hits_by_cache']['semantic']:,} semantic)",
         f"output limit  {limit['over_limit']:,} of {limit['limited_replies']:,} replies went over the soft limit "
         f"({_fmt_pct(limit['over_rate'])}), by {_fmt_num(limit['avg_over_by'])} tokens on average "
         f"(max {_fmt_num(limit['max_over_by'])})",

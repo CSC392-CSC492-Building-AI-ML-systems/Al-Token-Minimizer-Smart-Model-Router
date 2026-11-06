@@ -6,6 +6,8 @@ dependencies = [
     "fastapi[standard]>=0.141.1",
     "google-genai>=2.25.0",
     "python-dotenv>=1.2.3",
+    "redisvl>=0.28.0",
+    "sentence-transformers>=6.2.0",
     "tree-sitter>=0.25.2,<0.26",
     "tree-sitter-javascript>=0.25.0,<0.26",
 ]

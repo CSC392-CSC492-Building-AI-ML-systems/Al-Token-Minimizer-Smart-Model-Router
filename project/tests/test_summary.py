@@ -167,6 +167,20 @@ def test_success_rate_only_counts_ok(db_path):
     assert summary["success_rate"] == pytest.approx(1 / len(db.STATUSES))
 
 
+def test_cache_hits_are_counted_by_which_cache_answered(db_path):
+    add(db_path, cache_status="hit", cache_hit="semantic", latency_cache_ms=20)
+    add(db_path, cache_status="hit", cache_hit="exact")
+    add(db_path, cache_status="hit", cache_hit="exact")
+    add(db_path, cache_status="miss", latency_cache_ms=15)
+
+    summary = db.summarize_requests(db_path)
+
+    assert summary["cache"]["hits_by_cache"] == {"exact": 2, "semantic": 1}
+    assert summary["cache"]["hit_rate"] == pytest.approx(3 / 4)
+    assert summary["latency_ms"]["cache"]["max"] == 20
+    assert "2 exact, 1 semantic" in db.format_summary(summary)
+
+
 @pytest.mark.parametrize(
     "values",
     [[42.0], [10.0, 20.0], [5.0, 1.0, 3.0, 2.0, 4.0], [float(v * v % 97) for v in range(1, 60)]],
