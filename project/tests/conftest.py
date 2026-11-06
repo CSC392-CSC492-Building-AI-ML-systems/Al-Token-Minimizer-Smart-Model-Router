@@ -28,6 +28,6 @@ from cache import semantic  # noqa: E402
 def no_semantic_cache(monkeypatch):
     """Tests never touch Redis or load the embedding model: every lookup
     misses, nothing is stored and server startup doesn't load the model. Tests of the cache itself patch these again."""
-    monkeypatch.setattr(semantic, "lookup", lambda prompt, model: None)
-    monkeypatch.setattr(semantic, "store", lambda prompt, model, answer: None)
+    monkeypatch.setattr(semantic, "lookup", lambda prompt, model, settings="": None)
+    monkeypatch.setattr(semantic, "store", lambda prompt, model, settings, answer: None)
     monkeypatch.setattr(semantic, "warm_up", lambda: None)

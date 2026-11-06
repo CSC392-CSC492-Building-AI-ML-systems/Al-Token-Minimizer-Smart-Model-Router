@@ -71,7 +71,10 @@ def numbers_in(text):
 def _check_number(expected, tolerance):
     def check(reply):
         found = numbers_in(reply)
-        if any(abs(n - expected) <= tolerance for n in found):
+        # Treat the final number as the answer. An expected value mentioned in
+        # working followed by a contradictory result must not pass by accident.
+        # Judgeable cases can still accept alternative explanatory formatting.
+        if found and abs(found[-1] - expected) <= tolerance:
             return True, f"found {expected:g}"
         return False, f"expected {expected:g}, reply has {found[:8]}"
 
@@ -698,6 +701,13 @@ def verbose_json():
         missing = {"answer", "confidence"} - set(value)
         if missing:
             return False, f"missing keys {sorted(missing)}"
+        if set(value) != {"answer", "confidence"}:
+            return False, "unexpected JSON keys"
+        confidence = value["confidence"]
+        if not isinstance(value["answer"], str) or value["answer"].casefold() != "canberra":
+            return False, "incorrect capital"
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+            return False, "confidence must be a number between 0 and 1"
         return True, "valid JSON with both keys" + (" (in a code block)" if fenced else "")
 
     return Case(
@@ -746,7 +756,7 @@ def verbose_bullets():
 
     def check(reply):
         bullets = count_bullets(reply)
-        return bullets <= 3, f"{bullets} bullet points"
+        return bool(reply.strip()) and bullets <= 3, f"{bullets} bullet points"
 
     return Case(
         name="verbose_bullets",
@@ -822,7 +832,94 @@ def label_of(item_key):
     )
 
 
-# every test, by name, in the order runs and reports list them
+def _check_exact_json(expected):
+    """Check both the answer and the requested format, without executing model code."""
+    def check(reply):
+        inner, _ = strip_fence(reply)
+        try:
+            actual = json.loads(inner)
+        except ValueError:
+            return False, "reply is not just JSON"
+        passed = json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True)
+        return passed, "exact JSON answer" if passed else "incorrect JSON answer"
+
+    return check
+
+
+def cache_cases():
+    """Two exact duplicates and two close requests that must have distinct keys."""
+    prompt = "What is 17 + 25?"
+    system = "Reply with only a JSON integer."
+    variants = (
+        ("cache_original", prompt, system, 42),
+        ("cache_exact_repeat", prompt, system, 42),
+        ("cache_near_prompt", "What is 17 + 26?", system, 43),
+        ("cache_near_system", prompt, 'Reply with only a JSON object with the key "answer".', {"answer": 42}),
+    )
+    return [
+        Case(name=name, category="Cache identity", prompt=text, system=instruction,
+             check=_check_exact_json(expected), judge=False, expected=json.dumps(expected))
+        for name, text, instruction, expected in variants
+    ]
+
+
+def code_controls():
+    """Small programs whose literals, comments or newlines carry important meaning."""
+    variants = (
+        (
+            "python_literal_whitespace",
+            'What JSON string does this print? Reply with only that JSON string.\n\n'
+            '```python\nimport json\n\ntext = """first  row\n    second row"""\n\nprint(json.dumps(text))\n```',
+            "first  row\n    second row",
+        ),
+        (
+            "python_docstring_contract",
+            'What JSON string does this print? Reply with only that JSON string.\n\n'
+            '```python\nimport json\n\ndef label():\n    """Price in cents, not dollars."""\n    return 100\n\n'
+            'print(json.dumps(label.__doc__))\n```',
+            "Price in cents, not dollars.",
+        ),
+        (
+            "js_newline_semantics",
+            'What does JSON.stringify(result()) return? Reply with only the JSON value.\n\n'
+            '```javascript\nfunction value() {\n  return\n  { price: 42 };\n}\n\n'
+            'function result() {\n  const label = `first  row\n    second row`;\n'
+            '  return [value() === undefined, label];\n}\n```',
+            [True, "first  row\n    second row"],
+        ),
+    )
+    return [
+        Case(name=name, category="Code semantics", prompt=prompt, system=None,
+             check=_check_exact_json(expected), judge=False, expected=json.dumps(expected))
+        for name, prompt, expected in variants
+    ]
+
+
+def concise_cases():
+    expected = {"name": "Ava", "city": "Toronto", "items": ["pen", "notebook", "mug"]}
+    return [
+        Case(
+            name="concise_required_details", category="Conciseness",
+            prompt='Ava lives in Toronto and ordered a pen, notebook, and mug. '
+                   'Return only JSON with name, city, and items. Include every item in order.',
+            system=None, check=_check_exact_json(expected), judge=False, expected=json.dumps(expected),
+        ),
+        Case(
+            name="concise_explicit_length", category="Conciseness",
+            prompt='Write exactly these four numbered lines, including all details:\n'
+                   '1. Read the input.\n2. Validate the input.\n3. Calculate the result.\n4. Return the result.',
+            system=None,
+            check=lambda reply: (
+                reply.strip() == '1. Read the input.\n2. Validate the input.\n3. Calculate the result.\n4. Return the result.',
+                "four requested lines must be preserved",
+            ),
+            judge=False,
+        ),
+    ]
+
+
+# Every test, by name, in the order runs and reports list them. Cache duplicates
+# are deliberate workload entries, not accidental duplicate test names.
 TESTS = {
     case.name: case
     for case in (
@@ -834,5 +931,8 @@ TESTS = {
         verbose_bullets(),
         control_short(),
         cents_comment(),
+        *cache_cases(),
+        *code_controls(),
+        *concise_cases(),
     )
 }

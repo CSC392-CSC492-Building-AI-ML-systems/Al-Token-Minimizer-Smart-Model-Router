@@ -1,5 +1,7 @@
+from dataclasses import replace
+
 from model_data.model_package import ModelPackage
-from compressor.pipeline import Prompt, compress
+from compressor.pipeline import Prompt, compress, label, resolve_stages, validate_pipeline
 
 class CompressorService:
     """
@@ -11,6 +13,7 @@ class CompressorService:
     compressed_text: str
     model_package: ModelPackage
     stages: list[str]
+    pipeline: str
 
     def __init__(
         self,
@@ -18,15 +21,24 @@ class CompressorService:
         model_package: ModelPackage,
         output: str | None = None,
         stages=(),
+        *,
+        pipeline: str | None = None,
     ):
+        if pipeline is not None:
+            validate_pipeline(pipeline)
+            if stages:
+                raise ValueError("choose either stages or a pipeline preset, not both")
+            stages = pipeline
+        resolved = resolve_stages(stages)
         original_prompt = prompt if isinstance(prompt, Prompt) else Prompt(prompt)
-        compressed_prompt = compress(original_prompt, stages)
+        compressed_prompt = compress(original_prompt, resolved)
 
-        # render(): the text actually sent, knowledge-base chunks included
         self.input_text = original_prompt.render()
+        self.original_prompt = original_prompt
         self.output_text = output
         self.model_package = model_package
-        self.stages = list(stages)
+        self.stages = list(resolved)
+        self.pipeline = pipeline if pipeline is not None else label(resolved)
         self.compressed_prompt = compressed_prompt
         self.compressed_text = compressed_prompt.render()
 
@@ -42,11 +54,36 @@ class CompressorService:
         Token information
         """
         tokenizer = self.model_package.tokenizer.count
-        uncompressed = self.input_text
-        compressed = self.compressed_text
+        # Include system instructions, including concise guidance added by a stage.
+        # Reuse identical counts within this request to avoid duplicate API calls.
+        counts = {}
 
-        uncompressed_input_tokens, compressed_input_tokens = tokenizer(uncompressed), tokenizer(compressed)
-        tokens_saved = uncompressed_input_tokens - compressed_input_tokens # if this becomes negative then we did not compress properly
+        def count_prompt(prompt):
+            total = 0
+            for text in (prompt.render(), prompt.system):
+                if not text:
+                    continue
+                if text not in counts:
+                    counts[text] = tokenizer(text)
+                total += counts[text]
+            return total
+
+        uncompressed_input_tokens = count_prompt(self.original_prompt)
+        compressed_input_tokens = count_prompt(self.compressed_prompt)
+        if "code" in self.stages:
+            # Fewer characters do not always mean fewer model tokens. Keep
+            # concise guidance, but undo code compaction if its real count grew.
+            original_text_tokens = counts.get(self.original_prompt.render(), 0)
+            compact_text_tokens = counts.get(self.compressed_prompt.render(), 0)
+            if compact_text_tokens > original_text_tokens:
+                compressed_input_tokens -= compact_text_tokens - original_text_tokens
+                self.compressed_prompt = replace(
+                    self.compressed_prompt, text=self.original_prompt.text,
+                    context=self.original_prompt.context,
+                )
+                self.compressed_text = self.original_prompt.render()
+        # May be negative for a conciseness policy, which targets output tokens.
+        tokens_saved = uncompressed_input_tokens - compressed_input_tokens
 
         return {
             "uncompressed_input_tokens" : uncompressed_input_tokens,
@@ -103,9 +140,3 @@ class CompressorService:
             "output_cost": output_cost,
             "savings": savings
         }
-
-
-
-
-
-    
