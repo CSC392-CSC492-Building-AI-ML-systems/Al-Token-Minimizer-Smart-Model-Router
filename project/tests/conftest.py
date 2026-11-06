@@ -17,6 +17,9 @@ _tmp = Path(tempfile.mkdtemp(prefix="token-minimizer-tests-"))
 atexit.register(shutil.rmtree, _tmp, ignore_errors=True)  # don't leave a folder behind per run
 log_setup.LOG_DIR = _tmp / "logs"
 os.environ.setdefault("TELEMETRY_DB_PATH", str(_tmp / "telemetry.db"))
+# Off unless a test turns it on (test_semantic_cache.py does), so the other
+# tests see only the exact cache
+os.environ["SEMANTIC_CACHE_ENABLED"] = "false"
 
 
 import pytest  # noqa: E402

@@ -4,14 +4,10 @@ services:
     container_name: redis-cache
     ports:
       - "6379:6379"
-    volumes:
-      - redis-data:/data
     environment:
-      # Redis keeps its data under 3 GB, dropping the least recently used entries,
-      # and writes every change to disk (appendonly) so the cache survives restarts
-      - REDIS_ARGS=--maxmemory 3gb --maxmemory-policy allkeys-lru --appendonly yes
+      # Redis keeps its data under 3 GB, dropping the least recently used entries.
+      # Memory only: nothing is written to disk (no appendonly file, no snapshots),
+      # so the cache is empty again whenever the container restarts.
+      - REDIS_ARGS=--maxmemory 3gb --maxmemory-policy allkeys-lru --appendonly no --save ""
     mem_limit: 4g  # hard cap for the whole container, with room for Redis's own overhead
     restart: unless-stopped
-
-volumes:
-  redis-data:

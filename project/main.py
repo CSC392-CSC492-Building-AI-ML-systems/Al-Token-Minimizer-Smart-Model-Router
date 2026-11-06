@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(app):
     """Runs when the server starts: loads the semantic cache's embedding model
     (a few seconds), so the first request doesn't wait for it."""
+    if not SEMANTIC_CACHE_ENABLED:
+        yield
+        return
     try:
         semantic.warm_up()
     except Exception:
@@ -60,8 +63,12 @@ def _env_bool(name, default):
     return value in ("true", "1")
 
 
+# CACHE_ENABLED=false turns off both caches; EXACT_CACHE_ENABLED and
+# SEMANTIC_CACHE_ENABLED turn off one each.
+CACHE_ENABLED = _env_bool("CACHE_ENABLED", True)
+SEMANTIC_CACHE_ENABLED = CACHE_ENABLED and _env_bool("SEMANTIC_CACHE_ENABLED", True)
 response_cache = ResponseCache(
-    enabled=_env_bool("CACHE_ENABLED", True),
+    enabled=CACHE_ENABLED and _env_bool("EXACT_CACHE_ENABLED", True),
     max_entries=int(os.environ.get("CACHE_MAX_ENTRIES", "256")),
     ttl_seconds=float(os.environ.get("CACHE_TTL_SECONDS", "300")),
 )
@@ -195,7 +202,7 @@ def _answer(
         # Anything besides the prompt that changes the answer, so the semantic
         # cache only reuses answers made with the same stages and output limit.
         cache_settings = f"{pipeline.fingerprint(stages)}\0{soft_output_limit}"
-        use_cache = cache != "off" and response_cache.enabled
+        use_cache = cache != "off" and (response_cache.enabled or SEMANTIC_CACHE_ENABLED)
         if use_cache:
             record.cache_status = "refresh" if cache == "refresh" else "miss"
             cached = response_cache.get(key) if cache == "use" else None
@@ -205,7 +212,7 @@ def _answer(
                 record.input_tokens_compressed = cached.input_tokens_compressed
                 return cached.text
             # Exact miss: try an earlier prompt that means the same
-            if cache == "use":
+            if cache == "use" and SEMANTIC_CACHE_ENABLED:
                 cache_start = time.perf_counter()
                 similar = _cache_lookup(prompt, cache_settings)
                 record.latency_cache_ms = _ms_since(cache_start)
@@ -250,7 +257,8 @@ def _answer(
                 input_tokens_compressed=record.input_tokens_compressed,
                 output_tokens=record.output_tokens,
             ))
-            _cache_store(original_prompt, cache_settings, text)
+            if SEMANTIC_CACHE_ENABLED:
+                _cache_store(original_prompt, cache_settings, text)
         return text
     except Exception as exc:
         fill_from_error(record, exc)  # sets status + error fields, then the error still goes out

@@ -28,6 +28,11 @@ def temp_db(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def semantic_cache_on(monkeypatch):
+    monkeypatch.setattr(main, "SEMANTIC_CACHE_ENABLED", True)  # conftest turns it off for the other tests
+
+
+@pytest.fixture(autouse=True)
 def empty_exact_cache(monkeypatch):
     """A new exact cache per test, so an earlier test's answer isn't an exact hit here."""
     monkeypatch.setattr(main, "response_cache", ResponseCache())
@@ -150,14 +155,44 @@ def test_refresh_asks_gemini_and_stores_the_new_answer(monkeypatch, client, stor
     assert [(text, answer) for text, _, answer in stored] == [("hello", "from gemini")]
 
 
-def test_the_kill_switch_turns_off_the_semantic_cache_too(monkeypatch, client, stored):
-    monkeypatch.setattr(main, "response_cache", ResponseCache(enabled=False))
+def test_semantic_cache_enabled_false_skips_it(monkeypatch, client, stored):
+    monkeypatch.setattr(main, "SEMANTIC_CACHE_ENABLED", False)
     monkeypatch.setattr(semantic, "lookup", lambda *args: pytest.fail("cache was checked"))
     monkeypatch.setattr(main.client.interactions, "create", lambda **kw: ok_reply())
 
-    client.post("/ask", json={"prompt": "hello", "cache": "use"})
+    response = client.post("/ask", json={"prompt": "hello", "cache": "use"})
 
+    assert response.json()["cache_status"] == "miss"  # the exact cache still ran
     assert stored == []
+
+
+def test_semantic_cache_works_with_the_exact_cache_off(monkeypatch, client, stored):
+    monkeypatch.setattr(main, "response_cache", ResponseCache(enabled=False))
+    monkeypatch.setattr(semantic, "lookup", lambda prompt, model, settings: "from cache")
+
+    response = client.post("/ask", json={"prompt": "hello", "cache": "use"})
+
+    assert response.json()["text"] == "from cache"
+    [row] = db.fetch_requests(request_id=response.json()["request_id"])
+    assert row["cache_hit"] == "semantic"
+
+
+def test_both_off_is_disabled(monkeypatch, client, stored):
+    monkeypatch.setattr(main, "response_cache", ResponseCache(enabled=False))
+    monkeypatch.setattr(main, "SEMANTIC_CACHE_ENABLED", False)
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: ok_reply())
+
+    response = client.post("/ask", json={"prompt": "hello", "cache": "use"})
+
+    assert response.json()["cache_status"] == "disabled"
+
+
+def test_startup_skips_the_model_when_the_semantic_cache_is_off(monkeypatch):
+    monkeypatch.setattr(main, "SEMANTIC_CACHE_ENABLED", False)
+    monkeypatch.setattr(semantic, "warm_up", lambda: pytest.fail("model was loaded"))
+
+    with TestClient(main.app):
+        pass
 
 
 def test_a_broken_cache_still_answers(monkeypatch, client):
@@ -216,3 +251,39 @@ def test_startup_still_works_without_redis(monkeypatch):
 
     with TestClient(main.app) as client:
         assert client.post("/ask", json={"prompt": "hello"}).status_code == 200
+
+
+# ---------------------------------------------------------------- settings
+
+
+def test_ttl_comes_from_env(monkeypatch):
+    monkeypatch.setenv("SEMANTIC_CACHE_TTL_SECONDS", "60")
+    assert semantic._ttl_seconds() == 60
+
+
+def test_ttl_defaults_to_5_hours(monkeypatch):
+    monkeypatch.delenv("SEMANTIC_CACHE_TTL_SECONDS", raising=False)
+    assert semantic._ttl_seconds() == 5 * 60 * 60
+
+
+def test_ttl_must_be_positive(monkeypatch):
+    monkeypatch.setenv("SEMANTIC_CACHE_TTL_SECONDS", "0")
+    with pytest.raises(ValueError):
+        semantic._ttl_seconds()
+
+
+def test_distance_threshold_comes_from_env(monkeypatch):
+    monkeypatch.setenv("SEMANTIC_CACHE_DISTANCE_THRESHOLD", "0.25")
+    assert semantic._distance_threshold() == 0.25
+
+
+def test_distance_threshold_defaults_to_0_1(monkeypatch):
+    monkeypatch.delenv("SEMANTIC_CACHE_DISTANCE_THRESHOLD", raising=False)
+    assert semantic._distance_threshold() == 0.1
+
+
+@pytest.mark.parametrize("value", ["-0.1", "2.5"])
+def test_distance_threshold_must_be_between_0_and_2(monkeypatch, value):
+    monkeypatch.setenv("SEMANTIC_CACHE_DISTANCE_THRESHOLD", value)
+    with pytest.raises(ValueError):
+        semantic._distance_threshold()

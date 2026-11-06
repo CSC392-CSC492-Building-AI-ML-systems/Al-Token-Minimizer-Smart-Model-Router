@@ -13,6 +13,9 @@ answer. Pass the prompt from before compression.
 
 Needs Redis Stack running (docker compose up -d in this folder). REDIS_URL in
 .env points somewhere else; the default is redis://localhost:6379.
+In .env: SEMANTIC_CACHE_TTL_SECONDS sets how long entries last (default 5
+hours), SEMANTIC_CACHE_DISTANCE_THRESHOLD how close in meaning a question has
+to be for a hit (default 0.1), SEMANTIC_CACHE_ENABLED=false turns it off.
 
 To see what's in the cache, from the project folder:
     uv run python -m cache.semantic list              # newest entries first
@@ -28,8 +31,8 @@ import time
 from compressor.pipeline import Prompt
 
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
-DISTANCE_THRESHOLD = 0.1  # cosine distance, about similarity 0.9 and up; tune with the benchmark
-TTL_SECONDS = 7 * 24 * 60 * 60  # entries expire after a week
+DEFAULT_DISTANCE_THRESHOLD = 0.1  # cosine distance, about similarity 0.9 and up; tune with the benchmark
+DEFAULT_TTL_SECONDS = 5 * 60 * 60  # entries expire after 5 hours, unless .env says otherwise
 CACHE_NAME = "semantic_cache"  # Redis index name, and the prefix of every key
 
 _cache = None
@@ -38,6 +41,26 @@ _vectorizer = None  # kept apart from _cache, so a failed Redis connection doesn
 
 def _redis_url():
     return os.environ.get("REDIS_URL", "redis://localhost:6379")
+
+
+# The two settings below are read when the cache is made, after main.py loads .env.
+
+
+def _ttl_seconds():
+    """SEMANTIC_CACHE_TTL_SECONDS from .env. Only affects entries stored from then on."""
+    ttl = int(os.environ.get("SEMANTIC_CACHE_TTL_SECONDS", DEFAULT_TTL_SECONDS))
+    if ttl <= 0:
+        raise ValueError("SEMANTIC_CACHE_TTL_SECONDS must be a positive number of seconds")
+    return ttl
+
+
+def _distance_threshold():
+    """SEMANTIC_CACHE_DISTANCE_THRESHOLD from .env: 0 only matches the same
+    meaning exactly, higher allows looser matches (cosine distance, 0 to 2)."""
+    threshold = float(os.environ.get("SEMANTIC_CACHE_DISTANCE_THRESHOLD", DEFAULT_DISTANCE_THRESHOLD))
+    if not 0 <= threshold <= 2:
+        raise ValueError("SEMANTIC_CACHE_DISTANCE_THRESHOLD must be between 0 and 2")
+    return threshold
 
 
 def _get_vectorizer():
@@ -60,8 +83,8 @@ def _get_cache():
         _cache = SemanticCache(
             name=CACHE_NAME,
             redis_url=_redis_url(),
-            distance_threshold=DISTANCE_THRESHOLD,
-            ttl=TTL_SECONDS,
+            distance_threshold=_distance_threshold(),
+            ttl=_ttl_seconds(),
             vectorizer=_get_vectorizer(),
             filterable_fields=[{"name": "scope", "type": "tag"}],
         )
@@ -165,11 +188,12 @@ def _cli_check(args):
     if not hits:
         print("The cache is empty.")
         return
-    print(f"Closest entries to {question!r} (a hit needs distance <= {DISTANCE_THRESHOLD} and the same scope):\n")
+    threshold = _distance_threshold()
+    print(f"Closest entries to {question!r} (a hit needs distance <= {threshold} and the same scope):\n")
     print(f"{'distance':>8}  {'':<6}  {'scope':<8}  {'prompt':<50}  response")
     for hit in hits:
         distance = float(hit["vector_distance"])
-        mark = "close" if distance <= DISTANCE_THRESHOLD else ""
+        mark = "close" if distance <= threshold else ""
         print(
             f"{distance:>8.3f}  {mark:<6}  {hit.get('scope', '')[:8]:<8}  "
             f"{_short(hit['prompt'], 50):<50}  {_short(hit['response'], 60)}"
