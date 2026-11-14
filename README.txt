@@ -31,6 +31,7 @@ HOW THE CODE FITS TOGETHER
       -> Gemini interactions.create
       -> gemini_parse.py: parse response and classify failures
       -> db.py: one metadata-only SQLite telemetry row per accepted request
+      -> ui.py: a more user friendly interface
 
 response_cache.py holds bounded, expiring answers in process memory.
 benchmark/ runs the same POST /ask path with isolated telemetry and cache state.
@@ -274,3 +275,10 @@ legacy behavior, parsing, schema migration, compression semantics, cache identit
 TTL/LRU/limits, zero-usage hits, privacy, CLI payloads, and benchmark phases.
 Mocked tests establish implementation behavior. Real model quality, output-token
 savings, and live latency still need a benchmark run with valid credentials.
+
+
+UI 
+
+    uv run streamlit run ui.py
+
+Requires streamlit. Includes options to enable and disable functions for privacy and speed. 
