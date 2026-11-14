@@ -160,6 +160,8 @@ class SemanticChunker:
 
 
 CHUNKERS = {"token": TokenChunker, "sliding": SlidingWindowChunker, "semantic": SemanticChunker}
+# best recall and fewest tokens on the test questions, see kb.evaluate
+DEFAULT_STRATEGY = "semantic"
 
 
 def chunk_pages(pages, chunker: Chunker) -> list[Chunk]:

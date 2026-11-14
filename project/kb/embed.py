@@ -1,8 +1,8 @@
 """Embed the chunks and save an index for each chunking strategy.
 
 Run from the project folder:
-    uv run python -m kb.embed                      # token strategy
-    uv run python -m kb.embed --strategy semantic  # or sliding, or all
+    uv run python -m kb.embed                   # default strategy (semantic)
+    uv run python -m kb.embed --strategy token  # or sliding, or all
 """
 
 import argparse
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from kb.chunk import CHUNKERS, chunk_pages
+from kb.chunk import CHUNKERS, DEFAULT_STRATEGY, chunk_pages
 from kb.load import kb_version, load_corpus
 
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"  # same model as the semantic cache
@@ -30,7 +30,7 @@ def get_model():
     return _model
 
 
-def build_index(strategy="token", index_dir=INDEX_DIR):
+def build_index(strategy=DEFAULT_STRATEGY, index_dir=INDEX_DIR):
     """Save vectors to index.npy and chunk details to index.json, in index/<strategy>/."""
     pages = load_corpus()
     chunker = CHUNKERS[strategy]()
@@ -57,7 +57,7 @@ def build_index(strategy="token", index_dir=INDEX_DIR):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build the knowledge-base index.")
-    parser.add_argument("--strategy", choices=[*CHUNKERS, "all"], default="token")
+    parser.add_argument("--strategy", choices=[*CHUNKERS, "all"], default=DEFAULT_STRATEGY)
     args = parser.parse_args()
     for strategy in CHUNKERS if args.strategy == "all" else [args.strategy]:
         meta, vectors = build_index(strategy)
