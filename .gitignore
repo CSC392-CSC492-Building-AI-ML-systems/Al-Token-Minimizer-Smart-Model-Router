@@ -12,6 +12,9 @@ __pycache__/
 # benchmark runs (replies, per-run db and reports)
 project/benchmark/results/
 
+# knowledge-base index, rebuilt from kb/corpus with `python -m kb.embed`
+project/kb/index/
+
 # logs
 logs/
 *.log

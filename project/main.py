@@ -2,6 +2,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -15,6 +16,8 @@ from cache import semantic
 from compressor import pipeline
 from compressor.compressor_service import CompressorService
 from gemini_parse import fill_from_error, fill_from_interaction, reply_text
+from kb.chunk import CHUNKERS, DEFAULT_STRATEGY as DEFAULT_KB_STRATEGY
+from kb.retrieve import retrieve
 from log_setup import setup_logging
 from model_data.model_package import ModelPackage
 from model_data.token_counter import GeminiTokenCounter
@@ -54,6 +57,8 @@ model_package = ModelPackage(pricing=None, tokenizer=GeminiTokenCounter(client))
 # flagged (see _call_gemini).
 DEFAULT_SOFT_OUTPUT_LIMIT = None
 DEFAULT_COMPRESSION = pipeline.validate_pipeline(os.environ.get("COMPRESSION_LEVEL", pipeline.DEFAULT_PIPELINE))
+# How many knowledge-base chunks go before the prompt when a request asks for them.
+KB_TOP_K = 3
 
 
 def _env_bool(name, default):
@@ -110,6 +115,17 @@ class AskRequest(BaseModel):
     # reply length in output tokens the model is asked to stay under. Leave it out
     # (or null) for no limit
     soft_output_limit: int | None = Field(DEFAULT_SOFT_OUTPUT_LIMIT, gt=0)
+    # Knowledge-base chunks before the prompt, off unless asked for. kb uses the
+    # default chunking strategy; naming one in kb_strategy turns kb on too.
+    kb: bool = False
+    kb_strategy: str | None = None
+
+    @field_validator("kb_strategy")
+    @classmethod
+    def _known_kb_strategy(cls, name):
+        if name is not None and name not in CHUNKERS:
+            raise ValueError(f"unknown kb strategy {name!r}, expected one of {sorted(CHUNKERS)}")
+        return name
 
     @field_validator("compression")
     @classmethod
@@ -134,6 +150,10 @@ class AskRequest(BaseModel):
             self.stages if self.stages is not None else self.compression or DEFAULT_COMPRESSION
         )
 
+    def selected_kb_strategy(self):
+        """The chunking strategy to retrieve with, or None for no knowledge base."""
+        return self.kb_strategy or (DEFAULT_KB_STRATEGY if self.kb else None)
+
 
 # HTTP code POST /ask answers with when the request fails, by db status.
 # 429 is passed through as is, so a caller (like the benchmark) knows to slow down.
@@ -154,14 +174,14 @@ def _request_error(record):
 
 @app.post("/ask")
 def ask_post(body: AskRequest):
-    """Like GET /ask, but takes a system prompt and compression stages or a preset, and
-    returns the request_id of the row saved for it (also on failure, in `detail`).
-    `over_limit` says whether the reply went over soft_output_limit."""
+    """Like GET /ask, but takes a system prompt, compression stages or a preset, and
+    knowledge-base chunks, and returns the request_id of the row saved for it (also
+    on failure, in `detail`). `over_limit` says whether the reply went over soft_output_limit."""
     record = db.RequestRecord(endpoint="/ask", model=MODEL)
     try:
         text = _answer(
             record, pipeline.Prompt(body.prompt, body.system), body.selected_stages(), body.cache,
-            body.soft_output_limit,
+            body.soft_output_limit, body.selected_kb_strategy(),
         )
     except Exception:
         raise _request_error(record) from None
@@ -169,6 +189,8 @@ def ask_post(body: AskRequest):
         "text": text,
         "request_id": record.request_id,
         "cache_status": record.cache_status,
+        "cache_hit": record.cache_hit,  # which cache answered: "exact", "semantic", or None
+        "kb_strategy": record.kb_strategy,  # chunking strategy the KB chunks came from, or None
         "over_limit": bool(record.over_limit),
     }
 
@@ -179,19 +201,30 @@ def _answer(
     stages=(),
     cache="off",
     soft_output_limit: int | None = DEFAULT_SOFT_OUTPUT_LIMIT,
+    kb_strategy: str | None = None,
 ) -> str:
-    """Compress the prompt, send it to Gemini and return the reply text.
+    """Add knowledge-base chunks, compress the prompt, send it to Gemini and return the reply text.
 
     `soft_output_limit` is the reply length Gemini is asked to aim for (None for
-    no limit), see _call_gemini. Fills `record` along the way and saves it at
-    the end, also when something raises (the error is re-raised after that).
+    no limit), see _call_gemini. `kb_strategy` picks the chunks put before the
+    prompt (None for none). Fills `record` along the way and saves it at the
+    end, also when something raises (the error is re-raised after that).
     """
     start = time.perf_counter()
     record.compression = pipeline.label(stages)
     record.compression_version = pipeline.PIPELINE_VERSION
     record.cache_status = "off" if cache == "off" else "disabled"
     record.soft_output_limit = soft_output_limit
+    record.kb_strategy = kb_strategy
     try:
+        if kb_strategy is not None:
+            # Before the cache lookups, since both caches key on the chunks
+            kb_start = time.perf_counter()
+            try:
+                prompt = replace(prompt, context=_kb_context(prompt.text, kb_strategy))
+            finally:
+                record.latency_kb_ms = _ms_since(kb_start)
+
         key = make_cache_key(
             model=MODEL, prompt=prompt.text, system=prompt.system,
             context=tuple((chunk.text, chunk.source) for chunk in prompt.context),
@@ -269,6 +302,17 @@ def _answer(
         record.error_message = None
         record.latency_total_ms = _ms_since(start)
         _save(record)
+
+
+def _kb_context(question, strategy):
+    """The KB_TOP_K knowledge-base chunks closest to the question, labelled with their ids."""
+    try:
+        hits = retrieve(question, k=KB_TOP_K, strategy=strategy)
+    except FileNotFoundError:
+        logger.error("No %s knowledge-base index, build it with: uv run python -m kb.embed --strategy %s",
+                     strategy, strategy)
+        raise
+    return tuple(pipeline.Chunk(hit["text"], hit["id"]) for hit in hits)
 
 
 def _mark_cache_hit(record, kind):
