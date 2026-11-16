@@ -24,7 +24,8 @@ If a machine's uv configuration redirects PyPI, use UV_NO_CONFIG=1 and
 HOW THE CODE FITS TOGETHER
 
     ask.py / HTTP caller
-      -> main.py: validate request, check optional exact-match cache,
+      -> main.py: validate request, add knowledge-base chunks if asked
+         (kb/retrieve.py), check optional exact-match cache,
          then the semantic cache (cache/semantic.py, Redis)
       -> compressor/pipeline.py: ordered stages selected directly or by preset
       -> compressor/compressor_service.py: count original and transformed input
@@ -60,6 +61,8 @@ and bypasses the response cache. Prefer POST to keep prompts out of URLs.
     uv run --frozen python ask.py --compression full --cache use "Explain this"
     cat snippet.txt | uv run --frozen python ask.py --compression code
     cat snippet.txt | uv run --frozen python ask.py --stages code concise
+    uv run --frozen python ask.py --kb "How do I make a query parameter optional?"
+    uv run --frozen python ask.py --kb-strategy sliding "How do I make a query parameter optional?"
     uv run --frozen python ask.py --usage
 
 COMPRESSION LEVELS (CSC-14, CSC-16, CSC-17)
@@ -101,6 +104,37 @@ provider framing overhead. Gemini-reported usage is stored separately. A negativ
 input-token saving is valid when concise guidance adds more input than code saves.
 If code compaction increases the actual model token count, the service restores
 the original user text while retaining any selected concise-answer guidance.
+
+KNOWLEDGE BASE
+
+Optional, off by default. With "kb": true (ask.py --kb) the 3 chunks of the
+FastAPI tutorial pages in kb/corpus/ closest to the prompt are put before it,
+each labelled with its page and position, e.g. [tutorial-body.md#3]. The
+default chunking strategy is semantic; "kb_strategy": "token" or "sliding"
+(ask.py --kb-strategy token) picks another one and turns the KB on too. The
+response and the telemetry row say which strategy was used (kb_strategy), and
+latency_kb_ms is the time retrieval took. The chunks are part of the prompt, so
+they're counted in input_tokens_raw and are part of both caches' identity.
+
+The index isn't committed. Build it once, and again after changing kb/corpus/
+(the server logs a warning when an index is out of date):
+
+    uv run python -m kb.embed --strategy all
+
+The first KB request after the server starts loads the embedding model, a few
+seconds. Other commands, from the project folder:
+
+    uv run python -m kb.load          pages and their hashes
+    uv run python -m kb.chunk         chunk counts and sizes for each strategy
+    uv run python -m kb.retrieve "question" [--strategy token] [-k 5]
+    uv run python -m kb.evaluate      compare the strategies on the test questions
+    uv run python -m kb.inline_code   pull code examples into new pages (needs internet)
+
+kb.evaluate has 27 test questions, each labelled with the page and a phrase
+that answers it. On them, semantic found the answer in the top 3 most often
+(74%, vs 70% for token and sliding) with the fewest tokens (about 395 for the
+top 3, vs 530 and 546), which is why it's the default. 27 questions is a small
+set, so a gap of a question or two isn't conclusive.
 
 SOFT OUTPUT LIMIT (CSC-19)
 

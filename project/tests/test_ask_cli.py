@@ -70,6 +70,18 @@ def test_double_dash_separates_stage_names_from_prompt(transport):
     assert json.loads(request.data)["prompt"] == "Explain this"
 
 
+def test_kb_flag_asks_for_the_default_strategy(transport):
+    assert ask.cli(["--kb", "How", "do", "I", "test?"]) == 0
+    [(request, _)] = transport
+    assert json.loads(request.data) == {"prompt": "How do I test?", "cache": "off", "kb": True}
+
+
+def test_kb_strategy_flag_sends_the_strategy(transport):
+    assert ask.cli(["--kb-strategy", "sliding", "How do I test?"]) == 0
+    [(request, _)] = transport
+    assert json.loads(request.data) == {"prompt": "How do I test?", "cache": "off", "kb_strategy": "sliding"}
+
+
 def test_usage_requests_existing_summary_endpoint(transport):
     assert ask.cli(["--usage"]) == 0
     [(request, timeout)] = transport
@@ -86,6 +98,8 @@ def test_usage_requests_existing_summary_endpoint(transport):
     ["--usage", "hello"],
     ["--usage", "--system", "ignored"],
     ["--usage", "--stages"],
+    ["--usage", "--kb"],
+    ["--kb-strategy", "unknown", "hello"],
     ["--stages", "unknown-stage"],
     ["--compression", "full", "--stages", "code"],
 ])

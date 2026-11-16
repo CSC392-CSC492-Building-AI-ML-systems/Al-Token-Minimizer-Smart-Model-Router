@@ -343,6 +343,95 @@ def test_equal_rendered_text_with_different_chunk_boundaries_does_not_share_cach
     assert [row["cache_status"] for row in db.fetch_requests()] == ["miss", "miss"]
 
 
+# ---------------------------------------------------------------- knowledge base
+
+
+@pytest.fixture
+def fake_retrieve(monkeypatch):
+    """Retrieval without the embedding model or a built index. Records each call."""
+    calls = []
+
+    def retrieve(question, k, strategy):
+        calls.append((question, k, strategy))
+        return [{"id": f"page.md#{i}", "text": f"{strategy} chunk {i}"} for i in range(1, k + 1)]
+
+    monkeypatch.setattr(main, "retrieve", retrieve)
+    return calls
+
+
+def test_kb_is_off_by_default(monkeypatch, client, fake_retrieve):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
+
+    response = client.post("/ask", json={"prompt": "hi"})
+
+    assert response.json()["kb_strategy"] is None
+    assert fake_retrieve == []
+    assert sent["input"] == "hi"
+    assert db.fetch_requests()[0]["kb_strategy"] is None
+
+
+def test_kb_adds_default_strategy_chunks_before_the_prompt(monkeypatch, client, fake_retrieve):
+    sent = {}
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: sent.update(kw) or ok_reply())
+
+    response = client.post("/ask", json={"prompt": "how do I read a query param?", "kb": True})
+
+    assert response.status_code == 200
+    assert response.json()["kb_strategy"] == main.DEFAULT_KB_STRATEGY
+    assert fake_retrieve == [("how do I read a query param?", main.KB_TOP_K, main.DEFAULT_KB_STRATEGY)]
+    assert sent["input"].startswith(f"Context:\n[page.md#1]\n{main.DEFAULT_KB_STRATEGY} chunk 1")
+    assert sent["input"].endswith("Question:\nhow do I read a query param?")
+    row = db.fetch_requests()[0]
+    assert row["kb_strategy"] == main.DEFAULT_KB_STRATEGY
+    assert row["latency_kb_ms"] >= 0
+    assert row["input_tokens_raw"] == len(sent["input"].split())  # the chunks are counted
+
+
+def test_kb_strategy_picks_another_strategy(monkeypatch, client, fake_retrieve):
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: ok_reply())
+
+    response = client.post("/ask", json={"prompt": "hi", "kb_strategy": "sliding"})
+
+    assert response.json()["kb_strategy"] == "sliding"
+    assert [strategy for _, _, strategy in fake_retrieve] == ["sliding"]
+
+
+def test_post_ask_rejects_unknown_kb_strategy(client, fake_retrieve):
+    response = client.post("/ask", json={"prompt": "hi", "kb_strategy": "nope"})
+    assert response.status_code == 422
+    assert fake_retrieve == []
+
+
+def test_missing_kb_index_fails_and_is_saved(monkeypatch, client):
+    def no_index(question, k, strategy):
+        raise FileNotFoundError("no index")
+
+    monkeypatch.setattr(main, "retrieve", no_index)
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: pytest.fail("Gemini was called"))
+
+    response = client.post("/ask", json={"prompt": "hi", "kb": True})
+
+    assert response.status_code == 500
+    row = db.fetch_requests()[0]
+    assert row["status"] == db.STATUS_INTERNAL_ERROR
+    assert row["kb_strategy"] == main.DEFAULT_KB_STRATEGY
+
+
+def test_kb_strategy_is_part_of_the_cache_identity(monkeypatch, client, fake_retrieve):
+    from response_cache import ResponseCache
+
+    monkeypatch.setattr(main, "response_cache", ResponseCache())
+    monkeypatch.setattr(main.client.interactions, "create", lambda **kw: ok_reply())
+
+    statuses = [
+        client.post("/ask", json={"prompt": "hi", "cache": "use", **options}).json()["cache_status"]
+        for options in ({"kb": True}, {"kb_strategy": "token"}, {}, {"kb": True})
+    ]
+
+    assert statuses == ["miss", "miss", "miss", "hit"]
+
+
 # ---------------------------------------------------------------- db migration
 
 

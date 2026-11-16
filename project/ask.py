@@ -8,6 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from compressor.pipeline import PIPELINES, resolve_stages
+from kb.chunk import CHUNKERS, DEFAULT_STRATEGY as DEFAULT_KB_STRATEGY
 
 BASE = "http://127.0.0.1:8000"
 
@@ -21,6 +22,10 @@ def cli(argv=None):
     compression.add_argument("--stages", nargs="*", help="ordered stage names; use -- before a following prompt")
     parser.add_argument("--cache", choices=("off", "use", "refresh"), default="off",
                         help="reuse exact replies, refresh one, or bypass the cache (default: off)")
+    parser.add_argument("--kb", action="store_true",
+                        help=f"add knowledge-base chunks before the prompt ({DEFAULT_KB_STRATEGY} chunking)")
+    parser.add_argument("--kb-strategy", choices=sorted(CHUNKERS),
+                        help="use the knowledge base with this chunking strategy instead (implies --kb)")
     parser.add_argument("--usage", action="store_true", help="show stored telemetry totals instead")
     args = parser.parse_args(argv)
     if args.stages is not None:
@@ -31,8 +36,9 @@ def cli(argv=None):
 
     if args.usage:
         if (args.prompt or args.system is not None or args.compression is not None
-                or args.stages is not None or args.cache != "off"):
-            parser.error("--usage cannot be combined with a prompt, --system, --compression, --stages or --cache")
+                or args.stages is not None or args.cache != "off" or args.kb or args.kb_strategy is not None):
+            parser.error("--usage cannot be combined with a prompt, --system, --compression, --stages, --cache "
+                         "or --kb")
         request = Request(f"{BASE}/telemetry/summary", headers={"Accept": "application/json"})
         timeout = 10
     else:
@@ -48,6 +54,10 @@ def cli(argv=None):
             body["stages"] = args.stages
         elif args.compression is not None:
             body["compression"] = args.compression
+        if args.kb_strategy is not None:
+            body["kb_strategy"] = args.kb_strategy
+        elif args.kb:
+            body["kb"] = True
         request = Request(
             f"{BASE}/ask",
             data=json.dumps(body).encode("utf-8"),

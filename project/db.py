@@ -50,6 +50,7 @@ COLUMNS = {
     "compression_version": "TEXT",
     "cache_status": "TEXT CHECK (cache_status IN ('off', 'disabled', 'miss', 'hit', 'refresh'))",
     "cache_hit": "TEXT",  # which cache answered on a hit, "exact" or "semantic", else NULL
+    "kb_strategy": "TEXT",  # chunking strategy of the knowledge-base chunks added, NULL if none
     # tokens
     "input_tokens_raw": "INTEGER",  # our count before compression
     "input_tokens_compressed": "INTEGER",  # same as raw until compression exists
@@ -68,6 +69,7 @@ COLUMNS = {
     "latency_count_ms": "REAL",
     "latency_compress_ms": "REAL",  # time spent in the compression pipeline
     "latency_cache_ms": "REAL",  # time spent looking up the semantic cache
+    "latency_kb_ms": "REAL",  # time spent finding knowledge-base chunks
     # outcome
     "status": "TEXT NOT NULL CHECK (status IN (%s))"
     % ", ".join(f"'{s}'" for s in STATUSES),
@@ -94,6 +96,7 @@ LATENCY_COLUMNS = {
     "count": "latency_count_ms",
     "compress": "latency_compress_ms",
     "cache": "latency_cache_ms",
+    "kb": "latency_kb_ms",
 }
 
 SCHEMA = (
@@ -121,6 +124,7 @@ class RequestRecord:
     compression_version: str | None = None
     cache_status: str | None = None
     cache_hit: str | None = None
+    kb_strategy: str | None = None
     # tokens
     input_tokens_raw: int | None = None
     input_tokens_compressed: int | None = None
@@ -139,6 +143,7 @@ class RequestRecord:
     latency_count_ms: float | None = None
     latency_compress_ms: float | None = None
     latency_cache_ms: float | None = None
+    latency_kb_ms: float | None = None
     # outcome
     status: str | None = None
     http_status: int | None = None
