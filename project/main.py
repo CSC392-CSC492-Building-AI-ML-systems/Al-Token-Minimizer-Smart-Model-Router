@@ -48,8 +48,8 @@ api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
     raise RuntimeError("GEMINI_API_KEY not set, copy .env.example to .env and add your key")
 client = genai.Client(api_key=api_key)
-MODEL = "gemini-3.5-flash"
-model_package = ModelPackage(pricing=None, tokenizer=GeminiTokenCounter(client))
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+model_package = ModelPackage(pricing=None, tokenizer=GeminiTokenCounter(client, model=MODEL))
 # soft_output_limit when the client doesn't send one. The limit is an opt-in
 # add-on: off by default, so compression "none" stays an unchanged prompt. When
 # a client sends one, the prompt asks Gemini to aim for that many output tokens

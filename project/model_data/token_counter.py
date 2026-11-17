@@ -12,13 +12,14 @@ class TokenCounter:
 
 # Temporary space for GeminiTokenCounter 
 class GeminiTokenCounter(TokenCounter):
-    def __init__(self, client):
+    def __init__(self, client, model="gemini-3.5-flash"):
         self.client = client
+        self.model = model
 
     # Counts input tokens without generating anything
     def count(self, text: str) -> int:
         response = self.client.models.count_tokens(
-            model="gemini-3.5-flash",
+            model=self.model,
             contents=text
         )
 
