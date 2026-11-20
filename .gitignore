@@ -14,6 +14,8 @@ project/benchmark/results/
 
 # knowledge-base index, rebuilt from kb/corpus with `python -m kb.embed`
 project/kb/index/
+# pages users add through the /kb page (kb/manage.py)
+project/kb/user_corpus/
 
 # logs
 logs/

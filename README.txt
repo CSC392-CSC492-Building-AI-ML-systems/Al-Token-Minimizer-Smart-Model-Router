@@ -32,6 +32,7 @@ HOW THE CODE FITS TOGETHER
       -> Gemini interactions.create
       -> gemini_parse.py: parse response and classify failures
       -> db.py: one metadata-only SQLite telemetry row per accepted request
+      -> ui.py: a more user friendly interface
 
 response_cache.py holds bounded, expiring answers in process memory.
 benchmark/ runs the same POST /ask path with isolated telemetry and cache state.
@@ -120,6 +121,20 @@ The index isn't committed. Build it once, and again after changing kb/corpus/
 (the server logs a warning when an index is out of date):
 
     uv run python -m kb.embed --strategy all
+
+Adding pages: the Knowledge Hub tab in the UI (ui.py) uploads or pastes
+Markdown/text pages, lists them, removes added ones and searches the index.
+Added pages are saved to kb/user_corpus/ (gitignored; built-in pages in
+kb/corpus/ are read-only there), and the index is rebuilt in the background
+(about 20 seconds) and swapped in, so /ask uses it without a restart. The same
+actions are API endpoints (kb/manage.py does the work):
+
+    GET    /kb/pages            pages and index status
+    POST   /kb/pages            {"name": ..., "text": ...}, adds or replaces a page
+    DELETE /kb/pages/{name}     removes an added page
+    POST   /kb/rebuild          rebuilds the index without changing pages
+    GET    /kb/status           "ready", "rebuilding" or "error", and up_to_date
+    GET    /kb/search?q=...&k=3 the chunks /ask would add, without calling Gemini
 
 The first KB request after the server starts loads the embedding model, a few
 seconds. Other commands, from the project folder:
@@ -308,3 +323,10 @@ legacy behavior, parsing, schema migration, compression semantics, cache identit
 TTL/LRU/limits, zero-usage hits, privacy, CLI payloads, and benchmark phases.
 Mocked tests establish implementation behavior. Real model quality, output-token
 savings, and live latency still need a benchmark run with valid credentials.
+
+
+UI 
+
+    uv run streamlit run ui.py
+
+Requires streamlit. Includes options to enable and disable functions for privacy and speed. 

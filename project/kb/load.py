@@ -8,7 +8,8 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-CORPUS_DIR = Path(__file__).parent / "corpus"
+CORPUS_DIR = Path(__file__).parent / "corpus"  # the base pages, in git
+USER_CORPUS_DIR = Path(__file__).parent / "user_corpus"  # pages added through /kb, gitignored
 
 
 @dataclass(frozen=True)
@@ -18,13 +19,19 @@ class Page:
     sha256: str
 
 
-def load_corpus(folder=CORPUS_DIR):
-    """Every .md file in the folder, sorted by name."""
+def load_corpus(folders=None):
+    """Every .md file in the folder(s), sorted by name. A missing folder has no pages.
+    By default the base pages and the pages users added."""
+    if folders is None:
+        folders = (CORPUS_DIR, USER_CORPUS_DIR)
+    elif isinstance(folders, (str, Path)):
+        folders = (folders,)
     pages = []
-    for path in sorted(Path(folder).glob("*.md")):
-        text = path.read_text(encoding="utf-8")
-        pages.append(Page(path.name, text, hashlib.sha256(text.encode("utf-8")).hexdigest()))
-    return pages
+    for folder in folders:
+        for path in Path(folder).glob("*.md"):
+            text = path.read_text(encoding="utf-8")
+            pages.append(Page(path.name, text, hashlib.sha256(text.encode("utf-8")).hexdigest()))
+    return sorted(pages, key=lambda page: page.name)
 
 
 def kb_version(pages):

@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from google import genai
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -16,6 +16,7 @@ from cache import semantic
 from compressor import pipeline
 from compressor.compressor_service import CompressorService
 from gemini_parse import fill_from_error, fill_from_interaction, reply_text
+from kb import manage as kb_manage
 from kb.chunk import CHUNKERS, DEFAULT_STRATEGY as DEFAULT_KB_STRATEGY
 from kb.retrieve import retrieve
 from log_setup import setup_logging
@@ -405,3 +406,72 @@ def telemetry_summary(
         return db.summarize_requests(model=model, status=status, since=since, until=until)
     except ValueError as exc:  # since/until can't be converted to UTC (e.g. 0001-01-01T00:00+01:00)
         raise HTTPException(422, str(exc)) from exc
+
+
+# ------------------------------------------------------------ knowledge hub API
+# Used by the Knowledge Hub tab in ui.py. Added pages are saved to
+# kb/user_corpus/ and the index is rebuilt in the background (see kb/manage.py),
+# so /ask with kb=true uses them without a restart.
+
+
+class KbPage(BaseModel):
+    name: str
+    text: str
+
+
+@app.get("/kb/pages")
+def kb_pages():
+    """Every page (base pages are read-only) and the index status."""
+    return {"pages": kb_manage.list_pages(), "status": kb_manage.status()}
+
+
+@app.post("/kb/pages", status_code=201)
+def kb_add_page(page: KbPage, background: BackgroundTasks):
+    """Add (or replace) a user page and rebuild the index in the background."""
+    try:
+        saved = kb_manage.add_page(page.name, page.text)
+    except kb_manage.PageError as exc:
+        raise HTTPException(400, str(exc)) from None
+    _schedule_rebuild(background)
+    logger.info("Knowledge-base page %s %s", saved["name"], "replaced" if saved["replaced"] else "added")
+    return {**saved, "status": "rebuilding"}
+
+
+@app.delete("/kb/pages/{name}")
+def kb_delete_page(name: str, background: BackgroundTasks):
+    """Remove a user page and rebuild the index in the background."""
+    try:
+        removed = kb_manage.delete_page(name)
+    except kb_manage.PageError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except FileNotFoundError:
+        raise HTTPException(404, f"no user page called {name!r}") from None
+    _schedule_rebuild(background)
+    logger.info("Knowledge-base page %s removed", removed)
+    return {"name": removed, "status": "rebuilding"}
+
+
+@app.post("/kb/rebuild", status_code=202)
+def kb_rebuild(background: BackgroundTasks):
+    """Rebuild the index without changing pages, e.g. if there's none yet."""
+    _schedule_rebuild(background)
+    return {"status": "rebuilding"}
+
+
+@app.get("/kb/status")
+def kb_status():
+    return kb_manage.status()
+
+
+@app.get("/kb/search")
+def kb_search(q: str, k: Annotated[int, Query(ge=1, le=10)] = KB_TOP_K):
+    """The chunks /ask with kb=true would add for this question, without calling Gemini."""
+    try:
+        return {"hits": retrieve(q, k=k, strategy=DEFAULT_KB_STRATEGY)}
+    except FileNotFoundError:
+        raise HTTPException(409, "no knowledge-base index yet, rebuild it first") from None
+
+
+def _schedule_rebuild(background):
+    kb_manage.mark_pending()
+    background.add_task(kb_manage.rebuild)
