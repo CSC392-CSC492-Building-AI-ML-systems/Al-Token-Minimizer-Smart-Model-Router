@@ -139,3 +139,15 @@ class ResponseCache:
         for key, entry in list(self._entries.items()):
             if entry.expires_at <= now:
                 del self._entries[key]
+
+    def delete(self, key: str) -> bool:
+        with self._lock:
+            entry = self._entries.pop(key, None)
+            return entry is not None and entry.expires_at > self._clock()
+
+    def entries(self):
+        """Live entries, most recently used first: (key, CachedResponse, seconds_left)."""
+        with self._lock:
+            now = self._clock()
+            self._purge_expired(now)
+            return [(k, e.response, e.expires_at - now) for k, e in reversed(self._entries.items())]

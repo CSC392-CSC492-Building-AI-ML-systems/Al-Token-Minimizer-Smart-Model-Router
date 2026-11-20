@@ -44,14 +44,6 @@ st.title("Token Saver")
 
 
 # ------------------------------------------------------------------ helpers
-def looks_non_english(text, threshold=0.05):
-    """Rough check: share of letters outside ASCII. Only used to show a warning,
-    it is not language detection."""
-    letters = [c for c in text if c.isalpha()]
-    if not letters:
-        return False
-    return sum(ord(c) > 127 for c in letters) / len(letters) > threshold
-
 
 def compressed_preview(prompt, system, compression):
     """Run the selected stages locally and return (compressed_text, compressed_system).
@@ -100,9 +92,65 @@ def send_request(body, prompt, compression, cache_mode):
         st.json(detail) if isinstance(detail, (dict, list)) else st.code(str(detail))
 
 
+def delete_from_cache(request_id):
+    """Ask the API to remove the cached answer that this request used or created."""
+    try:
+        resp = requests.delete(f"{api_url}/cache/{request_id}", timeout=timeout)
+    except requests.RequestException as exc:
+        st.error(f"Could not reach the API: {exc}")
+        return
+    if resp.status_code == 404:
+        st.error("The API doesn't know this request_id (was the database reset?).")
+    elif not resp.ok:
+        st.error(f"Could not delete (HTTP {resp.status_code}).")
+        st.code(resp.text)
+    else:
+        data = resp.json()
+        if data.get("exact_cache_deleted"):
+            st.success("Removed from the exact cache. Sending this prompt again will generate a fresh answer.")
+        else:
+            st.info("Nothing to remove from the exact cache (it already expired or was evicted).")
+        if data.get("semantic_cache_deleted") is None:
+            st.warning(
+                "The similar-prompt (semantic) cache was not checked. It may still return this answer "
+                "for a similar prompt. Use cache mode 'refresh' or 'off' to bypass it."
+            )
+ 
+ 
+def load_cache():
+    """Fetch the cache listing into session state (used by the Cache tab)."""
+    try:
+        resp = requests.get(f"{api_url}/cache", timeout=timeout)
+        resp.raise_for_status()
+        st.session_state.cache_data = resp.json()
+        st.session_state.cache_error = None
+    except (requests.RequestException, ValueError) as exc:
+        st.session_state.cache_error = f"Could not load the cache: {exc}"
+ 
+ 
+def delete_cache_entry(key):
+    try:
+        resp = requests.delete(f"{api_url}/cache/key/{key}", timeout=timeout)
+        resp.raise_for_status()
+        deleted = resp.json().get("deleted")
+        st.session_state.cache_msg = "Entry deleted." if deleted else "That entry had already expired."
+    except (requests.RequestException, ValueError) as exc:
+        st.session_state.cache_msg = f"Could not delete the entry: {exc}"
+    load_cache()
+ 
+ 
+def clear_whole_cache():
+    try:
+        requests.delete(f"{api_url}/cache", timeout=timeout).raise_for_status()
+        st.session_state.cache_msg = "Exact cache cleared."
+    except requests.RequestException as exc:
+        st.session_state.cache_msg = f"Could not clear the cache: {exc}"
+    st.session_state.confirm_clear = False
+    load_cache()
+ 
 def _set_action(name):
     st.session_state.pending_action = name
-
+ 
 
 def privacy_summary():
     st.markdown(
@@ -129,7 +177,7 @@ if "history" not in st.session_state:
 if "pending" not in st.session_state:
     st.session_state.pending = None  # a request waiting for the user to review its compressed prompt
 
-tab_ask, tab_telemetry = st.tabs(["Ask", "Telemetry"])
+tab_ask, tab_telemetry, tab_cache = st.tabs(["Ask", "Telemetry", "Cache"])
 
 
 # ---------------------------------------------------------------- Ask tab
@@ -184,12 +232,6 @@ with tab_ask:
         if not prompt.strip():
             st.warning("Please enter a prompt.")
         else:
-            if compressing and looks_non_english(prompt):
-                st.warning(
-                    "This prompt looks non-English or mixed-language. Compression is built around "
-                    "English prompts, so it may lose more meaning or tokenize differently. "
-                    f"Consider the '{NO_COMPRESSION}' pipeline."
-                )
             body = {"prompt": prompt, "system": system.strip() or None, "cache": cache_mode}
             if compression:
                 body["compression"] = compression
@@ -352,3 +394,57 @@ with tab_telemetry:
             else:
                 st.error(f"HTTP {resp.status_code}")
                 st.code(resp.text)
+
+# ---------------------------------------------------------------- Cache tab
+with tab_cache:
+    st.caption(
+        "Answers stored by the exact-match cache. Keys are hashes of the request, so the original prompt "
+        "is not stored here, only the answer text. Entries expire on their own after the TTL. "
+        "Anyone who can reach the API can list and delete them."
+    )
+    st.button("Load / refresh", on_click=load_cache)
+ 
+    message = st.session_state.pop("cache_msg", None)
+    if message:
+        st.info(message)
+    if st.session_state.get("cache_error"):
+        st.error(st.session_state.cache_error)
+ 
+    cache_data = st.session_state.get("cache_data")
+    if cache_data is None:
+        st.write("Click **Load / refresh** to see what is cached.")
+    else:
+        if not cache_data.get("enabled"):
+            st.warning("The exact cache is disabled on the server, so nothing is stored in it.")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Entries", f"{len(cache_data['entries']):,} / {cache_data['max_entries']:,}")
+        m2.metric("TTL", f"{cache_data['ttl_seconds'] / 60:g} min")
+        m3.metric("Size of stored answers", f"{sum(len(e['text']) for e in cache_data['entries']):,} chars")
+ 
+        if not cache_data["entries"]:
+            st.write("The exact cache is empty.")
+        for entry in cache_data["entries"]:  # most recently used first
+            with st.container(border=True):
+                left, right = st.columns([6, 1])
+                left.markdown(f"`{entry['key'][:12]}…` · expires in {entry['expires_in_seconds'] / 60:.1f} min")
+                left.caption(
+                    f"input tokens {entry['input_tokens_raw']} raw / {entry['input_tokens_compressed']} compressed · "
+                    f"output tokens {entry['output_tokens'] if entry['output_tokens'] is not None else '-'}"
+                )
+                with left.expander("Cached answer"):
+                    st.markdown(entry["text"])
+                right.button("Delete", key=f"cache_del_{entry['key']}",
+                             on_click=delete_cache_entry, args=(entry["key"],))
+ 
+        if cache_data["entries"]:
+            st.checkbox("I want to delete every entry in the exact cache", key="confirm_clear")
+            st.button("Clear all", disabled=not st.session_state.get("confirm_clear"),
+                      on_click=clear_whole_cache)
+ 
+        if cache_data.get("semantic", {}).get("enabled"):
+            st.info(
+                "The similar-prompt (semantic) cache is on, but its entries can't be listed or deleted from "
+                "here yet. It may still answer prompts that mean the same as one you deleted above. "
+                "Use cache mode 'refresh' or 'off' to bypass it."
+            )
+ 

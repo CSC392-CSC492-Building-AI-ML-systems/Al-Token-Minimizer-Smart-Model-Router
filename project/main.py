@@ -405,3 +405,35 @@ def telemetry_summary(
         return db.summarize_requests(model=model, status=status, since=since, until=until)
     except ValueError as exc:  # since/until can't be converted to UTC (e.g. 0001-01-01T00:00+01:00)
         raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/cache")
+def list_cache():
+    return {
+        "enabled": response_cache.enabled,
+        "ttl_seconds": response_cache.ttl_seconds,
+        "max_entries": response_cache.max_entries,
+        "entries": [
+            {
+                "key": key,
+                "text": r.text,
+                "input_tokens_raw": r.input_tokens_raw,
+                "input_tokens_compressed": r.input_tokens_compressed,
+                "output_tokens": r.output_tokens,
+                "expires_in_seconds": round(left, 1),
+            }
+            for key, r, left in response_cache.entries()
+        ],
+        "semantic": {"enabled": SEMANTIC_CACHE_ENABLED},
+    }
+
+
+@app.delete("/cache/key/{key}")
+def delete_cache_key(key: str):
+    return {"deleted": response_cache.delete(key)}
+
+
+@app.delete("/cache")
+def clear_cache():
+    response_cache.clear()
+    return {"cleared": True}
