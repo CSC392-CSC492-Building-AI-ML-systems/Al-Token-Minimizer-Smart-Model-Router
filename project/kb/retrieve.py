@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 _indexes = {}  # strategy -> (meta, vectors), filled by get_index
 
 
-def load_index(strategy=DEFAULT_STRATEGY, index_dir=INDEX_DIR):
+def load_index(strategy=DEFAULT_STRATEGY, index_dir=None):
+    index_dir = INDEX_DIR if index_dir is None else index_dir
     folder = Path(index_dir) / strategy
     if not (folder / "index.json").exists():
         raise FileNotFoundError(
@@ -29,6 +30,8 @@ def load_index(strategy=DEFAULT_STRATEGY, index_dir=INDEX_DIR):
         )
     meta = json.loads((folder / "index.json").read_text(encoding="utf-8"))
     vectors = np.load(folder / "index.npy")
+    if len(vectors) != len(meta["chunks"]):  # read between the two renames of a rebuild
+        raise RuntimeError(f"the {strategy} index files don't match, rebuild it or try again")
     return meta, vectors
 
 

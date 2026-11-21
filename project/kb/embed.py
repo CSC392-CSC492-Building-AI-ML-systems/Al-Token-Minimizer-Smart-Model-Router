@@ -7,6 +7,7 @@ Run from the project folder:
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +41,6 @@ def build_index(strategy=DEFAULT_STRATEGY, index_dir=INDEX_DIR):
 
     out = Path(index_dir) / strategy
     out.mkdir(parents=True, exist_ok=True)
-    np.save(out / "index.npy", np.asarray(vectors, dtype=np.float32))
     meta = {
         "kb_version": kb_version(pages),
         "model": EMBEDDING_MODEL,
@@ -51,7 +51,13 @@ def build_index(strategy=DEFAULT_STRATEGY, index_dir=INDEX_DIR):
             for c in chunks
         ],
     }
-    (out / "index.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Write to temporary files, then rename over the old ones, so the server never
+    # reads a half-written index while /kb rebuilds it.
+    with open(out / "index.npy.tmp", "wb") as f:
+        np.save(f, np.asarray(vectors, dtype=np.float32))
+    (out / "index.json.tmp").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(out / "index.npy.tmp", out / "index.npy")
+    os.replace(out / "index.json.tmp", out / "index.json")
     return meta, vectors
 
 
